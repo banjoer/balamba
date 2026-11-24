@@ -1,0 +1,12 @@
+# Editor and OS noise
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python pane bytecode
+__pycache__/
+*.pyc
+
+# Local scratch state (tests use isolated dirs and clean up)
+/tmp/

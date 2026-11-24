@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+# balamba — tmux-based, keyboard-first coding workspace.
+#
+# Entry point: subcommand dispatch, doctor, and the handful of commands that do
+# not need tmux/git.  Real tmux, git and interactive-flow work lives in
+# lib/{tmux,git,task}.sh and pane/ui.py; see docs/architecture.md.
+
+set -Eeuo pipefail
+
+_balamba_self=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}")
+BALAMBA_BIN=$_balamba_self
+BALAMBA_ROOT=$(cd -P -- "$(dirname -- "$_balamba_self")/.." && pwd)
+export BALAMBA_BIN BALAMBA_ROOT
+
+if [[ ! -r $BALAMBA_ROOT/lib/common.sh ]]; then
+  printf 'balamba: error: cannot find lib/common.sh under %s\n' "$BALAMBA_ROOT" >&2
+  exit 2
+fi
+# shellcheck source=../lib/common.sh
+. "$BALAMBA_ROOT/lib/common.sh"
+
+# Later parts own these files; source them only when present so this part is
+# independently runnable and testable.
+for _balamba_lib in git tmux task; do
+  if [[ -f $BALAMBA_ROOT/lib/$_balamba_lib.sh ]]; then
+    # shellcheck disable=SC1090
+    . "$BALAMBA_ROOT/lib/$_balamba_lib.sh"
+  fi
+done
+unset _balamba_lib
+
+# ---------------------------------------------------------------------------
+# Output / usage
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<'EOF'
+usage: balamba [command] [args]
+
+Commands
+  (none), attach              attach to the balamba tmux session (restore if needed)
+  project add <path>          add a git main checkout as a project
+  project remove <path|id>    remove a project from balamba (never touches files)
+  project list                list projects
+  task list [project-id]      list tasks (optionally one project)
+  save                        save live tmux layout/cwd state to state.json
+  doctor                      check the environment and state
+  version                     print the version
+  help                        show this help
+
+Internal (tmux bindings and the UI panes)
+  internal new-task
+  internal add-project
+  internal new-terminal
+  internal close-task <project-id> <task-id>
+  internal activate <project-id> <context> [window]
+  internal expand <project-id> [task-id]
+  internal collapse <project-id> [task-id]
+
+Exit codes: 0 ok, 1 usage, 2 environment/state error.
+EOF
+}
+
+usage_error() {
+  printf 'balamba: error: %s\n' "$*" >&2
+  printf "try 'balamba help'\n" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# State lookups used by the internal commands
+# ---------------------------------------------------------------------------
+balamba_active_project_id() {
+  balamba_state_init
+  local pid
+  pid=$(balamba_state_get '.active.project // empty')
+  [[ -n $pid ]] || balamba_die "no active project; add one with 'balamba project add <path>'"
+  printf '%s\n' "$pid"
+}
+
+_balamba_require_project() {
+  local pid=$1 n
+  n=$(balamba_state_get '[.projects[] | select(.id == $pid)] | length' --arg pid "$pid")
+  [[ $n != 0 ]] || balamba_die "unknown project: $pid"
+}
+
+_balamba_require_task() {
+  local pid=$1 tid=$2 n
+  n=$(balamba_state_get \
+    '[.projects[] | select(.id == $pid) | .tasks[] | select(.id == $tid)] | length' \
+    --arg pid "$pid" --arg tid "$tid")
+  [[ $n != 0 ]] || balamba_die "unknown task: $tid (project $pid)"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_attach() {
+  (($# == 0)) || usage_error "attach takes no arguments"
+  balamba_require_func tmux_attach lib/tmux.sh "attach"
+  tmux_attach || exit $?
+}
+
+cmd_save() {
+  (($# == 0)) || usage_error "save takes no arguments"
+  balamba_require_func tmux_save_runtime lib/tmux.sh "save"
+  balamba_state_init
+  tmux_save_runtime || exit $?
+}
+
+cmd_project_add() {
+  (($# == 1)) || usage_error "usage: balamba project add <path>"
+  local path=$1
+  balamba_require_func git_project_validate lib/git.sh "project add"
+  balamba_require_func git_project_add lib/git.sh "project add"
+  balamba_state_init
+
+  if ! git_project_validate "$path"; then
+    printf 'balamba: error: not a usable git main checkout: %s\n' "$path" >&2
+    exit 2
+  fi
+
+  local id rc=0
+  id=$(git_project_add "$path") || rc=$?
+  ((rc == 0)) || exit "$rc"
+  printf 'added project %s: %s\n' "$id" "$path"
+}
+
+cmd_project_remove() {
+  (($# == 1)) || usage_error "usage: balamba project remove <path|id>"
+  local target=$1
+  balamba_require_func git_project_remove lib/git.sh "project remove"
+  balamba_state_init
+
+  local id rc=0
+  id=$(git_project_remove "$target") || rc=$?
+  ((rc == 0)) || exit "$rc"
+  if declare -F tmux_remove_project >/dev/null 2>&1; then
+    tmux_remove_project "$id" || true
+  fi
+  printf 'removed project %s\n' "${id:-$target}"
+}
+
+cmd_project_list() {
+  (($# == 0)) || usage_error "usage: balamba project list"
+  balamba_state_init
+
+  local -a rows=()
+  mapfile -t rows < <(balamba_state_get \
+    '(.projects // [])[] | [.id, .name, .path, ((.tasks // []) | length | tostring)] | @tsv')
+  if ((${#rows[@]} == 0)); then
+    printf 'no projects\n'
+    return 0
+  fi
+
+  local row id name path ntasks
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r id name path ntasks <<<"$row"
+    printf '%-24s %-20s %3s task(s)  %s\n' "$id" "$name" "$ntasks" "$path"
+  done
+}
+
+cmd_task_list() {
+  (($# <= 1)) || usage_error "usage: balamba task list [project-id]"
+  local pid=${1:-}
+  balamba_state_init
+
+  local -a rows=()
+  if [[ -n $pid ]]; then
+    _balamba_require_project "$pid"
+    mapfile -t rows < <(balamba_state_get \
+      '.projects[] | select(.id == $pid) | .id as $p | (.tasks // [])[]
+       | [$p, .id, .name, .branch, .path] | @tsv' --arg pid "$pid")
+  else
+    mapfile -t rows < <(balamba_state_get \
+      '(.projects // [])[] | .id as $p | (.tasks // [])[]
+       | [$p, .id, .name, .branch, .path] | @tsv')
+  fi
+
+  if ((${#rows[@]} == 0)); then
+    printf 'no tasks\n'
+    return 0
+  fi
+
+  local row project task name branch path
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r project task name branch path <<<"$row"
+    printf '%-30s %-24s %-14s %s\n' "$project/$task" "$name" "$branch" "$path"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Internal commands (tmux bindings + pane/ui.py actions)
+# ---------------------------------------------------------------------------
+cmd_internal() {
+  local action=${1:-}
+  (($#)) && shift
+  case $action in
+    new-task)     internal_new_task "$@" ;;
+    add-project)  internal_add_project "$@" ;;
+    new-terminal) internal_new_terminal "$@" ;;
+    close-task)   internal_close_task "$@" ;;
+    activate)     internal_activate "$@" ;;
+    expand)       internal_expand "$@" ;;
+    collapse)     internal_collapse "$@" ;;
+    "")           usage_error "internal: missing action" ;;
+    *)            usage_error "internal: unknown action: $action" ;;
+  esac
+}
+
+internal_new_task() {
+  (($# == 0)) || usage_error "usage: balamba internal new-task"
+  balamba_require_func task_new_flow lib/task.sh "new task"
+  local pid
+  pid=$(balamba_active_project_id)
+  task_new_flow "$pid" || exit $?
+}
+
+internal_add_project() {
+  (($# == 0)) || usage_error "usage: balamba internal add-project"
+  if declare -F project_add_flow >/dev/null 2>&1; then
+    project_add_flow || exit $?
+    return 0
+  fi
+  balamba_die "the interactive project-add flow is not available in this build: project_add_flow is missing (expected from lib/task.sh; that part is not implemented yet)"
+}
+
+internal_new_terminal() {
+  (($# == 0)) || usage_error "usage: balamba internal new-terminal"
+  balamba_require_func terminal_new_flow lib/task.sh "new terminal"
+  local pid context
+  pid=$(balamba_active_project_id)
+  context=$(balamba_state_get '.active.context // "proj"')
+  [[ -n $context ]] || context=proj
+  terminal_new_flow "$pid" "$context" || exit $?
+}
+
+internal_close_task() {
+  (($# == 2)) || usage_error "usage: balamba internal close-task <project-id> <task-id>"
+  balamba_require_func task_close_flow lib/task.sh "close task"
+  local pid=$1 tid=$2
+  balamba_state_init
+  _balamba_require_task "$pid" "$tid"
+  task_close_flow "$pid" "$tid" || exit $?
+}
+
+internal_activate() {
+  (($# == 2 || $# == 3)) || \
+    usage_error "usage: balamba internal activate <project-id> <context> [window]"
+  balamba_require_func tmux_activate lib/tmux.sh "activate"
+  local pid=$1 context=$2
+  local -a args=("$pid" "$context")
+  (($# == 3)) && args+=("$3")
+  tmux_activate "${args[@]}" || exit $?
+}
+
+internal_expand() {
+  (($# == 1 || $# == 2)) || usage_error "usage: balamba internal expand <project-id> [task-id]"
+  local pid=$1 tid=${2:-}
+  balamba_state_init
+  if [[ -n $tid ]]; then
+    _balamba_require_task "$pid" "$tid"
+    balamba_state_update \
+      '(.projects[] | select(.id == $pid) | .tasks[] | select(.id == $tid) | .expanded) = true' \
+      --arg pid "$pid" --arg tid "$tid"
+  else
+    _balamba_require_project "$pid"
+    balamba_state_update \
+      '(.projects[] | select(.id == $pid) | .expanded) = true' --arg pid "$pid"
+  fi
+}
+
+internal_collapse() {
+  (($# == 1 || $# == 2)) || usage_error "usage: balamba internal collapse <project-id> [task-id]"
+  local pid=$1 tid=${2:-}
+  balamba_state_init
+  if [[ -n $tid ]]; then
+    _balamba_require_task "$pid" "$tid"
+    balamba_state_update \
+      '(.projects[] | select(.id == $pid) | .tasks[] | select(.id == $tid) | .expanded) = false' \
+      --arg pid "$pid" --arg tid "$tid"
+  else
+    _balamba_require_project "$pid"
+    balamba_state_update \
+      '(.projects[] | select(.id == $pid) | .expanded) = false' --arg pid "$pid"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+_doctor_fail_count=0
+_doctor_warn_count=0
+
+doctor_line() {
+  printf '%-5s %-18s %s\n' "$1" "$2" "$3"
+}
+doctor_ok() {
+  doctor_line ok "$1" "${2-}"
+}
+doctor_warn() {
+  _doctor_warn_count=$((_doctor_warn_count + 1))
+  doctor_line warn "$1" "${2-}"
+}
+doctor_fail() {
+  _doctor_fail_count=$((_doctor_fail_count + 1))
+  doctor_line fail "$1" "${2-}"
+}
+
+cmd_doctor() {
+  (($# == 0)) || usage_error "usage: balamba doctor"
+  _doctor_fail_count=0
+  _doctor_warn_count=0
+
+  local -a tmo=()
+  if command -v timeout >/dev/null 2>&1; then
+    tmo=(timeout 5)
+  fi
+
+  # bash
+  if ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2))); then
+    doctor_ok bash "$BASH_VERSION"
+  else
+    doctor_fail bash "$BASH_VERSION (need >= 4.2)"
+  fi
+
+  # tmux
+  if command -v tmux >/dev/null 2>&1; then
+    local tv
+    tv=$(tmux -V 2>/dev/null || true)
+    if [[ $tv =~ ^tmux\ ([0-9]+)\.([0-9]+) ]]; then
+      local tmaj=${BASH_REMATCH[1]} tmin=${BASH_REMATCH[2]}
+      if ((tmaj > 3 || (tmaj == 3 && tmin >= 0))); then
+        doctor_ok tmux "$tv"
+      else
+        doctor_warn tmux "$tv (tested on tmux >= 3.0)"
+      fi
+    else
+      doctor_warn tmux "${tv:-tmux present, version unparseable}"
+    fi
+  else
+    doctor_fail tmux "not found on PATH"
+  fi
+
+  # python3 (pane/ui.py)
+  if command -v python3 >/dev/null 2>&1; then
+    local pyv
+    if pyv=$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null); then
+      if python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 6) else 1)' 2>/dev/null; then
+        doctor_ok python3 "$pyv"
+      else
+        doctor_fail python3 "$pyv (need >= 3.6)"
+      fi
+    else
+      doctor_fail python3 "found but not runnable"
+    fi
+  else
+    doctor_fail python3 "not found on PATH"
+  fi
+
+  # jq (all state operations)
+  if command -v jq >/dev/null 2>&1; then
+    local jqv
+    jqv=$(jq --version 2>/dev/null || true)
+    doctor_ok jq "${jqv:-present}"
+  else
+    doctor_fail jq "not found on PATH"
+  fi
+
+  # git
+  if command -v git >/dev/null 2>&1; then
+    local gv
+    gv=$(git --version 2>/dev/null || true)
+    doctor_ok git "${gv:-present}"
+  else
+    doctor_fail git "not found on PATH"
+  fi
+
+  # flock (state writers)
+  if command -v flock >/dev/null 2>&1; then
+    doctor_ok flock "available"
+  else
+    doctor_fail flock "not found; state writes cannot be made atomic"
+  fi
+
+  # opencode (agents only; never fail when the shared service is down)
+  if command -v opencode >/dev/null 2>&1; then
+    local ocv
+    if ocv=$("${tmo[@]}" opencode --version 2>/dev/null); then
+      doctor_ok opencode "${ocv:-present}"
+    else
+      doctor_warn opencode "found but 'opencode --version' failed"
+    fi
+    local svc
+    if svc=$("${tmo[@]}" opencode service status 2>&1); then
+      svc=${svc//$'\n'/ }
+      if [[ $svc =~ (stopped|not[[:space:]]+running|inactive|down) ]]; then
+        doctor_warn "opencode service" "${svc:-stopped} (agents may start it on demand)"
+      else
+        doctor_ok "opencode service" "${svc:-running}"
+      fi
+    else
+      doctor_warn "opencode service" "not running (agents may start it on demand)"
+    fi
+  else
+    doctor_warn opencode "not found; agent terminals unavailable"
+  fi
+
+  # config
+  if [[ -f $BALAMBA_CONFIG ]]; then
+    local cfg_syntax cfg_msg
+    if ! cfg_syntax=$(bash -n "$BALAMBA_CONFIG" 2>&1); then
+      doctor_fail config "syntax error in $BALAMBA_CONFIG: ${cfg_syntax//$'\n'/ }"
+    elif cfg_msg=$( (balamba_config_validate) 2>&1 >/dev/null ); then
+      doctor_ok config "$BALAMBA_CONFIG"
+    else
+      doctor_fail config "${cfg_msg:-invalid config: $BALAMBA_CONFIG}"
+    fi
+  else
+    balamba_config_defaults
+    doctor_ok config "defaults (no $BALAMBA_CONFIG)"
+  fi
+
+  # state
+  local state_valid=0
+  if [[ -f $BALAMBA_STATE ]]; then
+    local st_msg
+    if st_msg=$(balamba_state_validate "$BALAMBA_STATE" 2>&1); then
+      doctor_ok state "$BALAMBA_STATE"
+      state_valid=1
+    else
+      doctor_fail state "${st_msg:-invalid state: $BALAMBA_STATE}"
+    fi
+  else
+    doctor_ok state "not created yet ($BALAMBA_STATE)"
+  fi
+
+  # project/task paths referenced by a valid state
+  if ((state_valid)); then
+    local -a path_rows=()
+    mapfile -t path_rows < <(balamba_state_get \
+      '(.projects[] | [.id, .path] | @tsv), (.projects[] | .tasks[]? | [.id, .path] | @tsv)' \
+      2>/dev/null || true)
+    local missing=0 first_missing="" row _id row_path
+    for row in "${path_rows[@]}"; do
+      IFS=$'\t' read -r _id row_path <<<"$row"
+      if [[ ! -d $row_path ]]; then
+        missing=$((missing + 1))
+        [[ -n $first_missing ]] || first_missing=$row_path
+      fi
+    done
+    if ((missing == 0)); then
+      doctor_ok worktrees "all project/task paths exist"
+    else
+      doctor_warn worktrees "$missing missing (first: $first_missing)"
+    fi
+  fi
+
+  # private tmux server / stale socket
+  local sock
+  sock=$(balamba_tmux_socket_path)
+  if command -v tmux >/dev/null 2>&1; then
+    if "${tmo[@]}" tmux -L "$BALAMBA_SOCKET" has-session >/dev/null 2>&1; then
+      doctor_ok server "running (socket $sock)"
+    elif [[ -e $sock ]]; then
+      doctor_warn server "stale socket at $sock (next start replaces it)"
+    else
+      doctor_ok server "not running (cold start)"
+    fi
+  fi
+
+  if ((_doctor_fail_count > 0)); then
+    exit 2
+  fi
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+cmd_version() {
+  (($# == 0)) || usage_error "version takes no arguments"
+  printf 'balamba %s\n' "$BALAMBA_VERSION"
+}
+
+main() {
+  local cmd=${1:-attach}
+  (($#)) && shift
+
+  case $cmd in
+    attach)             cmd_attach "$@" ;;
+    project)
+      local sub=${1:-}
+      (($#)) && shift
+      case $sub in
+        add)    cmd_project_add "$@" ;;
+        remove) cmd_project_remove "$@" ;;
+        list)   cmd_project_list "$@" ;;
+        "")     usage_error "project: missing subcommand (add|remove|list)" ;;
+        *)      usage_error "project: unknown subcommand: $sub" ;;
+      esac
+      ;;
+    task)
+      local tsub=${1:-}
+      (($#)) && shift
+      case $tsub in
+        list) cmd_task_list "$@" ;;
+        "")   usage_error "task: missing subcommand (list)" ;;
+        *)    usage_error "task: unknown subcommand: $tsub" ;;
+      esac
+      ;;
+    save)     cmd_save "$@" ;;
+    doctor)   cmd_doctor "$@" ;;
+    version|--version|-V) cmd_version "$@" ;;
+    help|--help|-h) usage ;;
+    internal) cmd_internal "$@" ;;
+    *)        usage_error "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
