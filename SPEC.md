@@ -36,8 +36,10 @@ One tmux session `balamba`; each terminal tab is a tmux window; splits are tmux 
 ```
 
 - Chrome (tree + git) is replicated per window; the app treats it as one logical sidebar.
-  Only panes in the active window refresh; the rest sleep.
-- Sidebar width is a config value applied to every window.
+  Panes in the active window refresh at full rate; the others only check activation at ~0.2 Hz
+  (a non-focused pane receives no focus event when its window becomes active).
+- Sidebar width is a config value reasserted after attach and on activation; tmux has no
+  cross-window layout sync, so widths drift otherwise.
 - Empty context (project with no scratch terminals yet) gets one shell tab on first activation.
 - Tabs are native windows: clickable in the status bar, `C-a 1..9`, `C-a n/p`.
 
@@ -49,9 +51,11 @@ One tmux session `balamba`; each terminal tab is a tmux window; splits are tmux 
 - Keyboard: `j/k`/arrows move, `h/l` collapse/expand, `Enter` activate, `n` new task,
   `t` new terminal, `d` close task, `e` open in editor, `p` add project.
 - Mouse: click a row to select/activate, click the chevron to toggle, right-click for a menu.
-  Clicking a pane focuses it (native tmux).
+  With `mouse on` the first click on a non-focused pane both focuses it and is delivered.
+  Text selection needs `prefix+[` while a pane reports the mouse; wheel scrolling is in-app.
 - Unread marker: a dot on a terminal/task row when its window produced output since last visit
-  (from tmux's `window_activity_flag`). No bells, no desktop notifications, no agent-status plugin.
+  (`window_activity_flag`, requires `monitor-activity on`; the flag clears when a client views
+  the window). No bells, no desktop notifications, no agent-status plugin.
 
 ## Project
 
@@ -85,8 +89,9 @@ point (e.g. `origin/main`), which makes a stray `git push` target main.
 ## Terminals
 
 - Each terminal is a tab: `kind` (`agent`|`shell`), agent name, session uuid (agents), cwd.
-- Agent launch: `opencode --session <uuid>` in the tab's cwd. The uuid is generated at
-  creation, so each agent terminal keeps its own conversation across restarts.
+- Agent launch: `opencode --session ses_<32 hex>` in the tab's cwd. opencode rejects ids that do
+  not start with `ses_`, so generate `ses_` + uuid4 hex at creation. The session materialises on
+  the first message; the same id resumes it after a restart.
   Session titles are not set in opencode; readable names live in balamba's tree and tab title.
 - Shell launch: `$SHELL` in the tab's cwd.
 - New terminals: `t` / `C-a T` → menu `agent | shell`. Splits inside a tab are native tmux.
@@ -98,9 +103,13 @@ point (e.g. `origin/main`), which makes a stray `git push` target main.
 Trigger: `balamba` attaches to a running server (nothing to restore), or rebuilds from
 `state.json` when the server is gone (quit, crash, reboot).
 
-- Recreate windows/panes in saved order; restore split geometry from `window_layout`
-  when the pane count matches, otherwise equal splits.
-- Agents: relaunch `opencode --session <uuid>` in the saved cwd.
+- Recreate windows/panes in saved order; restore split geometry from `window_layout` only when
+  the live pane count equals the saved leaf count (a lower count is silently truncated otherwise),
+  else fall back to equal splits.
+- `window_layout` carries no active pane or active window: store and restore both separately.
+- Reassert sidebar widths after attach; tmux rescales each window's layout to the client size.
+- Agents: relaunch `opencode --session ses_<32 hex>` in the saved cwd, staggered ~0.5–1s apart
+  (each TUI costs 3–7s startup and ~160MB).
 - Shells: fresh `$SHELL` in the saved cwd (`pane_current_path` captured on detach + every poll).
 - Anything else (vim, dev server): a plain shell in the saved cwd.
 - Dying server-side cwd capture happens on detach and on the tree's periodic poll.
