@@ -56,6 +56,7 @@ Internal (tmux bindings and the UI panes)
   internal activate <project-id> <context> [window]
   internal expand <project-id> [task-id]
   internal collapse <project-id> [task-id]
+  internal status <path>
 
 Exit codes: 0 ok, 1 usage, 2 environment/state error.
 EOF
@@ -210,6 +211,7 @@ cmd_internal() {
     activate)     internal_activate "$@" ;;
     expand)       internal_expand "$@" ;;
     collapse)     internal_collapse "$@" ;;
+    status)       internal_status "$@" ;;
     "")           usage_error "internal: missing action" ;;
     *)            usage_error "internal: unknown action: $action" ;;
   esac
@@ -291,6 +293,17 @@ internal_collapse() {
     balamba_state_update \
       '(.projects[] | select(.id == $pid) | .expanded) = false' --arg pid "$pid"
   fi
+}
+
+# Read-only status document for the git pane.  Delegates to git_status_json so
+# there is exactly one implementation of the §9.6 contract.  The object is
+# printed even on failure (exit 2), which is what the pane displays.
+internal_status() {
+  (($# == 1)) || usage_error "usage: balamba internal status <path>"
+  balamba_require_func git_status_json lib/git.sh "status"
+  # The JSON object is printed even on failure (exit 2); the pane shows the
+  # documented error object instead of a shell trace.
+  git_status_json "$1" || exit $?
 }
 
 # ---------------------------------------------------------------------------
