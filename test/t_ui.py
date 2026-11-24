@@ -10,6 +10,7 @@ test/t_ui.sh runs this file together with the tmux/pty integration tests.
 """
 
 import importlib.util
+import ast
 import json
 import os
 import shlex
@@ -512,6 +513,20 @@ def test_render_smoke():
     check(len(lines) == 1, "tiny git pane degrades to one line")
 
 
+def test_python38_syntax():
+    """pane/ui.py must stay parseable by Python 3.8 (documented minimum)."""
+    with open(UI_PATH, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    try:
+        ast.parse(source, filename=UI_PATH, feature_version=(3, 8))
+        parsed = True
+        detail = ""
+    except SyntaxError as exc:
+        parsed = False
+        detail = str(exc)
+    check(parsed, "ui.py parses with Python 3.8 grammar", detail)
+
+
 def main():
     tests = [
         test_rows,
@@ -523,6 +538,7 @@ def main():
         test_git_formatting,
         test_context_and_state,
         test_render_smoke,
+        test_python38_syntax,
     ]
     for test in tests:
         test()

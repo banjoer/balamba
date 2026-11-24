@@ -49,9 +49,9 @@ Commands
   help                        show this help
 
 Internal (tmux bindings and the UI panes)
-  internal new-task
+  internal new-task [project-id]
   internal add-project
-  internal new-terminal
+  internal new-terminal [project-id] [context]
   internal close-task <project-id> <task-id>
   internal activate <project-id> <context> [window]
   internal expand <project-id> [task-id]
@@ -218,10 +218,15 @@ cmd_internal() {
 }
 
 internal_new_task() {
-  (($# == 0)) || usage_error "usage: balamba internal new-task"
+  (($# <= 1)) || usage_error "usage: balamba internal new-task [project-id]"
   balamba_require_func task_new_flow lib/task.sh "new task"
   local pid
-  pid=$(balamba_active_project_id)
+  if (($# == 1)); then
+    _balamba_require_project "$1"
+    pid=$1
+  else
+    pid=$(balamba_active_project_id)
+  fi
   task_new_flow "$pid" || exit $?
 }
 
@@ -235,11 +240,21 @@ internal_add_project() {
 }
 
 internal_new_terminal() {
-  (($# == 0)) || usage_error "usage: balamba internal new-terminal"
+  (($# <= 2)) || \
+    usage_error "usage: balamba internal new-terminal [project-id] [context]"
   balamba_require_func terminal_new_flow lib/task.sh "new terminal"
   local pid context
-  pid=$(balamba_active_project_id)
-  context=$(balamba_state_get '.active.context // "proj"')
+  if (($# >= 1)); then
+    _balamba_require_project "$1"
+    pid=$1
+  else
+    pid=$(balamba_active_project_id)
+  fi
+  if (($# == 2)); then
+    context=$2
+  else
+    context=$(balamba_state_get '.active.context // "proj"')
+  fi
   [[ -n $context ]] || context=proj
   terminal_new_flow "$pid" "$context" || exit $?
 }
@@ -366,10 +381,10 @@ cmd_doctor() {
   if command -v python3 >/dev/null 2>&1; then
     local pyv
     if pyv=$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null); then
-      if python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 6) else 1)' 2>/dev/null; then
+      if python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
         doctor_ok python3 "$pyv"
       else
-        doctor_fail python3 "$pyv (need >= 3.6)"
+        doctor_fail python3 "$pyv (need >= 3.8)"
       fi
     else
       doctor_fail python3 "found but not runnable"

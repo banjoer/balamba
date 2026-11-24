@@ -87,6 +87,7 @@ balamba_config_defaults() {
   editor=${EDITOR:-vi}
   default_ref=origin/main
   default_agent=opencode
+  restore_stagger=${BALAMBA_RESTORE_STAGGER:-1}
 
   declare -gA BALAMBA_AGENT_COMMAND=()
   declare -gA BALAMBA_AGENT_RESUME=()
@@ -152,6 +153,11 @@ balamba_config_validate() {
   [[ -n ${editor-} ]] || bad+=("editor must not be empty")
   [[ -n ${default_ref-} ]] || bad+=("default_ref must not be empty")
   [[ -n ${default_agent-} ]] || bad+=("default_agent must not be empty")
+  if [[ ! ${restore_stagger-} =~ ^[0-9]+$ ]]; then
+    bad+=("restore_stagger must be an integer (got '${restore_stagger-}')")
+  elif (( restore_stagger > 60 )); then
+    bad+=("restore_stagger must be between 0 and 60 seconds (got $restore_stagger)")
+  fi
   if [[ -n ${default_agent-} && -z ${BALAMBA_AGENT_COMMAND[$default_agent]-} ]]; then
     bad+=("no command template for default_agent '$default_agent'")
   fi

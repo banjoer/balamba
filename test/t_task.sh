@@ -402,6 +402,15 @@ helper_out=$(_task_helper_cmd printf '%s' "$WEIRD")
 quoted_out=$(sh -c "$helper_out")
 assert_eq "$WEIRD" "$quoted_out" "quoting: generated helper command preserves the value"
 
+# Long menu titles are fitted: tmux 3.4 silently drops a menu wider than the
+# client, which used to make the close dialog disappear for a verbose summary.
+LONG_TITLE=$(printf 'w%.0s' $(seq 1 200))
+FITTED=$(_task_fit_title "$LONG_TITLE")
+assert_eq "100" "${#FITTED}" "menu: a too-long title is capped at 100 columns"
+assert_eq "…" "${FITTED: -1}" "menu: the capped title ends with an ellipsis"
+assert_eq "close #1" "$(_task_fit_title 'close #1' | sed 's/##/#/g')" \
+  "menu: normal titles keep their text and format escaping"
+
 # a value quoted for tmux survives tmux's own parser ($ and ~ expand inside
 # double quotes, so this is the layer that bit before)
 tmux_quote_file=$BALAMBA_TEST_ROOT/tmux-quote.out
@@ -472,6 +481,34 @@ assert_eq "0" "$(balamba_state_get '[.projects[] | select(.id == $p)] | length' 
   "project remove: project gone from state"
 [[ -d $GTPATH ]] && _pass "project remove: worktree left on disk" || \
   _fail "project remove: worktree left on disk"
+
+# ---------------------------------------------------------------------------
+# Internal verbs accept an explicit target (no activate-then-delay race)
+# ---------------------------------------------------------------------------
+reset_all
+P_EXPLICIT=$(git_project_add "$REPO")
+P_OTHER=$(git_project_add "$SPACED_REPO")
+assert_eq "$P_OTHER" "$(balamba_state_get '.active.project')" \
+  "explicit target: the other project is active"
+export BALAMBA_FLOW_NAME="Explicit Task"
+export BALAMBA_FLOW_REF="origin/main"
+export BALAMBA_FLOW_KIND="shell"
+capture run_balamba internal new-task "$P_EXPLICIT"
+unset BALAMBA_FLOW_NAME BALAMBA_FLOW_REF BALAMBA_FLOW_KIND
+assert_eq "0" "$CAP_RC" "explicit target: internal new-task <project> succeeds"
+assert_eq "1" "$(balamba_state_get '
+  [.projects[] | select(.id == $p) | .tasks[]] | length
+' --arg p "$P_EXPLICIT")" "explicit target: task lands in the named project"
+assert_eq "0" "$(balamba_state_get '
+  [.projects[] | select(.id == $p) | .tasks[]] | length
+' --arg p "$P_OTHER")" "explicit target: the active project is untouched"
+before_other_tabs=$(project_tabs "$P_OTHER")
+export BALAMBA_FLOW_KIND="shell"
+capture run_balamba internal new-terminal "$P_EXPLICIT" proj
+unset BALAMBA_FLOW_KIND
+assert_eq "0" "$CAP_RC" "explicit target: internal new-terminal <pid> <ctx> succeeds"
+assert_eq "$before_other_tabs" "$(project_tabs "$P_OTHER")" \
+  "explicit target: new-terminal does not touch the active project"
 
 # ---------------------------------------------------------------------------
 # Interactive flows fail clearly with no attached client and create nothing

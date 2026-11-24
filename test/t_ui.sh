@@ -13,6 +13,8 @@ set -Eeuo pipefail
 . "$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/helpers.sh"
 # shellcheck source=../lib/common.sh
 . "$BALAMBA_ROOT/lib/common.sh"
+# shellcheck source=../lib/tmux.sh
+. "$BALAMBA_ROOT/lib/tmux.sh"
 
 TEST_DIR=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 UI=$BALAMBA_ROOT/pane/ui.py
@@ -180,6 +182,12 @@ write_empty_state() {
 }
 
 start_server
+# Install the real hook script (nudge/width/save) on this test server, then
+# re-assert the fast intervals the existing tests rely on.
+tmux_server_up >/dev/null 2>&1 || true
+tsess set -g @balamba_active_refresh 1 >/dev/null 2>&1 || true
+tsess set -g @balamba_idle_refresh 5 >/dev/null 2>&1 || true
+tsess set -g @balamba_git_refresh 1 >/dev/null 2>&1 || true
 TREE_STATE=$CASE/state/tree.json
 write_tree_state "$TREE_STATE"
 balamba_state_validate "$TREE_STATE" >/dev/null 2>&1
@@ -334,6 +342,44 @@ assert_eq "" "$(cat "$FAKE_LOG")" "tree: q is a no-op"
 kill_pane "$TREE_PANE"
 
 # ---------------------------------------------------------------------------
+# Non-active selection: n/t must name the clicked project, not activate first
+# ---------------------------------------------------------------------------
+RACE_PANE=$(new_ui_pane tree "$FAKE_ROOT" "$TREE_STATE" 40 16)
+tsess select-window -t "$RACE_PANE" >/dev/null 2>&1 || true
+if wait_contains "$RACE_PANE" "beta"; then
+  _pass "race: tree rendered for the non-active project test"
+else
+  _fail "race: tree rendered for the non-active project test" \
+    "$(capture "$RACE_PANE")"
+fi
+# Last row is the collapsed p_beta project.
+send_literal "$RACE_PANE" "G"
+sleep 0.2
+: >"$FAKE_LOG"
+send_literal "$RACE_PANE" "n"
+if wait_log_contains "internal new-task p_beta"; then
+  _pass "race: n on a non-active project names it explicitly"
+else
+  _fail "race: n on a non-active project names it explicitly" \
+    "$(cat "$FAKE_LOG")"
+fi
+assert_eq "1" "$(grep -Fxc 'internal new-task p_beta' "$FAKE_LOG" || true)" \
+  "race: n issues exactly one command (no activate + delayed new-task)"
+assert_eq "0" "$(grep -Fc 'internal activate' "$FAKE_LOG" || true)" \
+  "race: n does not schedule a separate activation"
+: >"$FAKE_LOG"
+send_literal "$RACE_PANE" "t"
+if wait_log_contains "internal new-terminal p_beta proj"; then
+  _pass "race: t on a non-active project names it explicitly"
+else
+  _fail "race: t on a non-active project names it explicitly" \
+    "$(cat "$FAKE_LOG")"
+fi
+assert_eq "0" "$(grep -Fc 'internal activate' "$FAKE_LOG" || true)" \
+  "race: t does not schedule a separate activation"
+kill_pane "$RACE_PANE"
+
+# ---------------------------------------------------------------------------
 # Tree: expand/collapse via internal verbs (state changed for real)
 # ---------------------------------------------------------------------------
 REAL_STATE=$CASE/state/real.json
@@ -378,8 +424,12 @@ assert_status 0 "empty state: pane stays alive" pane_alive "$EMPTY_PANE"
 kill_pane "$EMPTY_PANE"
 
 TINY_PANE=$(new_ui_pane tree "$FAKE_ROOT" "$TREE_STATE" 10 6)
-sleep 0.4
-TEXT=$(capture "$TINY_PANE")
+TEXT=""
+for _i in $(seq 1 100); do
+  TEXT=$(capture "$TINY_PANE")
+  [[ -n $TEXT ]] && break
+  sleep 0.05
+done
 assert_ne "" "$TEXT" "tiny pane: still shows readable output"
 assert_status 0 "tiny pane: stays alive at 10 columns" pane_alive "$TINY_PANE"
 kill_pane "$TINY_PANE"
@@ -472,6 +522,79 @@ assert_contains "$(capture "$GIT_PANE")" "README.md" \
   "git: wheel and r keep the file list"
 kill_pane "$GIT_PANE"
 
+# ---------------------------------------------------------------------------
+# Git freshness nudge: a focused/activated chrome pane refreshes immediately
+# ---------------------------------------------------------------------------
+tsess set -g @balamba_git_refresh 10 >/dev/null 2>&1 || true
+NUDGE_PANE=$(new_ui_pane git "$BALAMBA_ROOT" "$GIT_STATE" 44 20)
+tsess set-option -p -t "$NUDGE_PANE" @balamba_chrome git >/dev/null 2>&1 || true
+tsess select-window -t "$NUDGE_PANE" >/dev/null 2>&1 || true
+if wait_contains "$NUDGE_PANE" "README.md" 300; then
+  _pass "nudge: git pane rendered its initial status"
+else
+  _fail "nudge: git pane rendered its initial status" "$(capture "$NUDGE_PANE")"
+fi
+printf 'nudged\n' >"$GIT_REPO/nudge file.txt"
+tmux_nudge_window "$NUDGE_PANE"
+if wait_contains "$NUDGE_PANE" "nudge file.txt" 40; then
+  _pass "nudge: tmux_nudge_window refreshes the git pane immediately"
+else
+  _fail "nudge: tmux_nudge_window refreshes the git pane immediately" \
+    "$(capture "$NUDGE_PANE")"
+fi
+assert_contains "$(tsess show-hooks -g 2>/dev/null)" "nudge" \
+  "nudge: session activation hook is installed"
+assert_contains "$(tsess list-keys -T root 2>/dev/null)" "MouseDragEnd1Border" \
+  "nudge: mouse border-drag end binding is installed"
+
+# The installed hook (not only a direct call) refreshes on window activation.
+printf 'activated\n' >"$GIT_REPO/activated file.txt"
+OTHER_WIN=$(tsess new-window -d -P -F '#{window_id}' -t balamba: -n other \
+  'sleep 60')
+tsess select-window -t "$OTHER_WIN" >/dev/null 2>&1 || true
+sleep 0.2
+NUDGE_WIN=$(tsess display -p -t "$NUDGE_PANE" '#{window_id}')
+tsess select-window -t "$NUDGE_WIN" >/dev/null 2>&1 || true
+if wait_contains "$NUDGE_PANE" "activated file.txt" 40; then
+  _pass "nudge: switching windows refreshes the git pane within ~1s"
+else
+  _fail "nudge: switching windows refreshes the git pane within ~1s" \
+    "$(capture "$NUDGE_PANE")"
+fi
+tsess kill-window -t "$OTHER_WIN" >/dev/null 2>&1 || true
+
+# Nudge really writes a focus-in event into chrome panes.
+CAT_BYTES=$CASE/nudge.bytes
+CAT_READER=$CASE/readbytes.py
+cat >"$CAT_READER" <<'PY'
+import os
+import sys
+path = sys.argv[1]
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+while True:
+    data = os.read(0, 4096)
+    if not data:
+        break
+    os.write(fd, data)
+PY
+CAT_PANE=$(tsess new-window -d -P -F '#{pane_id}' -t balamba: -n nudge-cat \
+  "sh -c 'stty raw -echo; exec python3 $CAT_READER $CAT_BYTES'") || true
+if [[ -n ${CAT_PANE:-} ]]; then
+  tsess set-option -p -t "$CAT_PANE" @balamba_chrome tree >/dev/null 2>&1 || true
+  sleep 0.3
+  tmux_nudge_window "$CAT_PANE"
+  for _i in $(seq 1 100); do
+    [[ -s $CAT_BYTES ]] && break
+    sleep 0.02
+  done
+  assert_eq "$(printf '\033[I')" "$(cat "$CAT_BYTES" 2>/dev/null || true)" \
+    "nudge: chrome panes receive a focus-in event"
+  tsess kill-window -t "$CAT_PANE" >/dev/null 2>&1 || true
+fi
+tsess set -g @balamba_git_refresh 1 >/dev/null 2>&1 || true
+kill_pane "$NUDGE_PANE"
+rm -f -- "$GIT_REPO/nudge file.txt" "$GIT_REPO/activated file.txt"
+
 # Clean repository: the pane says clean.
 CLEAN_REPO=$CASE/clean
 mkdir -p -- "$CLEAN_REPO"
@@ -543,6 +666,264 @@ else
 fi
 assert_status 0 "git: error pane stays alive" pane_alive "$ERROR_PANE"
 kill_pane "$ERROR_PANE"
+
+# A path that does not exist at all: internal status still prints one JSON
+# error object, exits 2, and the pane renders it without dying.
+MISSING_REPO=$CASE/definitely-missing
+MISSING_STATE=$CASE/state/missing.json
+cat >"$MISSING_STATE" <<EOF
+{"version":1,"active":{"project":"p_missing","context":"proj","window":2},
+ "projects":[{"id":"p_missing","name":"missing","path":"$MISSING_REPO","expanded":true,
+  "tabs":[{"id":"tty_m0","name":"shell 1","kind":"shell","agent":null,
+   "session":null,"window":2,"pane_count":1,"layout":"","active_pane":0,
+   "panes":[{"index":0,"cwd":"$MISSING_REPO","launched":"shell"}]}],"tasks":[]}]}
+EOF
+MISSING_PANE=$(new_ui_pane git "$BALAMBA_ROOT" "$MISSING_STATE" 44 12)
+tsess select-window -t "$MISSING_PANE" >/dev/null 2>&1 || true
+if wait_contains "$MISSING_PANE" "not a git checkout" 300; then
+  _pass "git: missing path shows the status error"
+else
+  _fail "git: missing path shows the status error" "$(capture "$MISSING_PANE")"
+fi
+assert_status 0 "git: missing-path pane stays alive" pane_alive "$MISSING_PANE"
+kill_pane "$MISSING_PANE"
+
+# SIGWINCH: a real resize repaints at the new width, not at stale dimensions.
+RESIZE_PANE=$(new_ui_pane tree "$FAKE_ROOT" "$TREE_STATE" 40 14)
+tsess select-window -t "$RESIZE_PANE" >/dev/null 2>&1 || true
+if wait_contains "$RESIZE_PANE" "alpha"; then
+  _pass "resize: pane rendered before the resize"
+else
+  _fail "resize: pane rendered before the resize" "$(capture "$RESIZE_PANE")"
+fi
+tsess resize-window -t "$RESIZE_PANE" -x 24 -y 9 >/dev/null 2>&1 || true
+sleep 0.5
+RESIZE_TEXT=$(capture "$RESIZE_PANE")
+RESIZE_WIDTH=$(tsess display -p -t "$RESIZE_PANE" '#{pane_width}')
+assert_eq "24" "$RESIZE_WIDTH" "resize: pane width changed"
+assert_contains "$RESIZE_TEXT" "alpha" "resize: content survives SIGWINCH repaint"
+LONG_LINE=$(printf '%s\n' "$RESIZE_TEXT" | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')
+if ((LONG_LINE <= 24)); then
+  _pass "resize: repainted lines fit the new width"
+else
+  _fail "resize: repainted lines fit the new width" "longest line: $LONG_LINE"
+fi
+kill_pane "$RESIZE_PANE"
+
+# ---------------------------------------------------------------------------
+# Client targeting + menu/popup quoting with a real attached pty client
+# ---------------------------------------------------------------------------
+CLIENT_RC=0
+CLIENT_OUT=$CASE/client-target.out
+python3 - "$UI" "$BALAMBA_SOCKET" "$BALAMBA_ROOT" "$CASE" \
+  "$(balamba_tmux_socket_path)" >"$CLIENT_OUT" 2>&1 <<'PY' || CLIENT_RC=$?
+import importlib.util
+import json
+import os
+import pty
+import select
+import subprocess
+import sys
+import time
+
+ui_path, sock, repo_root, case, socket_path = sys.argv[1:6]
+tmux = ["tmux", "-L", sock]
+os.environ["TMUX"] = socket_path + ",123,0"
+checks = []
+
+
+def check(ok, name, detail=""):
+    checks.append(ok)
+    print(("ok " if ok else "not ok ") + name)
+    if not ok and detail:
+        print("# " + str(detail).replace("\n", " ")[:500])
+
+
+def run(*args, **kw):
+    return subprocess.run(list(args), capture_output=True, text=True, **kw)
+
+
+def wait_for(fn, timeout=5.0, interval=0.05):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            value = fn()
+        except Exception:
+            value = None
+        if value:
+            return value
+        time.sleep(interval)
+    return None
+
+
+def new_window(name):
+    return run(*tmux, "new-window", "-d", "-P", "-F", "#{pane_id}",
+               "-t", "balamba:", "-n", name, "sleep 600").stdout.strip()
+
+
+def window_index(pane):
+    return run(*tmux, "display", "-p", "-t", pane, "#{window_index}").stdout.strip()
+
+
+def clients():
+    out = run(*tmux, "list-clients", "-F", "#{client_name}").stdout
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def attach(session="balamba"):
+    pid, fd = pty.fork()
+    if pid == 0:
+        env = dict(os.environ)
+        env["TERM"] = "xterm-256color"
+        os.execvpe("tmux", ["tmux", "-L", sock, "attach", "-t", session],
+                   env)
+    return pid, fd
+
+
+pane_a = new_window("client-a")
+pane_b = new_window("client-b")
+pane_c = new_window("client-c")
+idx_a = window_index(pane_a)
+idx_b = window_index(pane_b)
+
+children = []
+fd_a = fd_b = None
+try:
+    pid_a, fd_a = attach()
+    children.append(pid_a)
+    first = wait_for(lambda: clients(), 5.0)
+    check(bool(first), "client targeting: first pty client attached", first)
+    client_a = first[0] if first else ""
+    # A second client needs its own (grouped) session: clients of one tmux
+    # session share the current window, so only separate sessions can view
+    # different windows at the same time.
+    run(*tmux, "new-session", "-d", "-s", "view2", "-t", "balamba")
+    pid_b, fd_b = attach("view2")
+    children.append(pid_b)
+    both = wait_for(lambda: clients() if len(clients()) >= 2 else None, 5.0)
+    check(bool(both), "client targeting: second pty client attached", both)
+    others = [c for c in (both or []) if c != client_a]
+    client_b = others[0] if others else ""
+    run(*tmux, "switch-client", "-c", client_a, "-t", "balamba:" + idx_a)
+    run(*tmux, "switch-client", "-c", client_b, "-t", "view2:" + idx_b)
+    time.sleep(0.3)
+
+    spec = importlib.util.spec_from_file_location("balamba_ui", ui_path)
+    ui = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ui)
+    check(ui.client_for_pane(pane_a) == client_a,
+          "client targeting: pane A resolves to its viewing client",
+          ui.client_for_pane(pane_a))
+    check(ui.client_for_pane(pane_b) == client_b,
+          "client targeting: pane B resolves to the other client",
+          ui.client_for_pane(pane_b))
+    check(ui.client_for_pane(pane_c) is None,
+          "client targeting: a window nobody views has no client",
+          ui.client_for_pane(pane_c))
+    check(ui.client_for_pane("") is None,
+          "client targeting: no pane id degrades to None")
+
+    # --- menu quoting: nasty project id, path with $ # quotes backslash ---
+    fake_root = os.path.join(case, "menu-fake")
+    os.makedirs(os.path.join(fake_root, "bin"), exist_ok=True)
+    argv_log = os.path.join(case, "menu-argv.log")
+    fake_bin = os.path.join(fake_root, "bin", "balamba")
+    with open(fake_bin, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\nprintf '%s\\0' \"$@\" >> \"$BALAMBA_FAKE_LOG\"\n")
+    os.chmod(fake_bin, 0o755)
+    editor_log = os.path.join(case, "menu-editor.log")
+    fake_editor = os.path.join(case, "fake-editor")
+    with open(fake_editor, "w", encoding="utf-8") as handle:
+        handle.write(
+            "#!/bin/sh\nprintf 'cwd=%s\\n' \"$PWD\" > \"$EDITOR_LOG\"\n")
+    os.chmod(fake_editor, 0o755)
+    run(*tmux, "set-environment", "-g", "BALAMBA_FAKE_LOG", argv_log)
+    run(*tmux, "set-environment", "-g", "EDITOR_LOG", editor_log)
+    nasty_pid = "p_we$ird #'\\\"x"
+    nasty_path = os.path.join(case, "work $dir #1 'q' \\ x")
+    os.makedirs(nasty_path, exist_ok=True)
+    state = {"version": 1,
+             "active": {"project": nasty_pid, "context": "proj",
+                        "window": int(idx_a or 0)},
+             "projects": [{"id": nasty_pid, "name": "nasty",
+                           "path": nasty_path, "expanded": True,
+                           "tabs": [], "tasks": []}]}
+    state_path = os.path.join(case, "menu-state.json")
+    with open(state_path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+
+    app = ui.UIApp("tree")
+    app.state = state
+    app.pane_id = pane_a
+    app.root = fake_root
+    app.bin = fake_bin
+    app.config["editor"] = fake_editor
+    row = {"kind": "task", "pid": nasty_pid, "tid": "t_x",
+           "context": "task:t_x", "path": nasty_path, "name": "nasty",
+           "expanded": True, "has_children": False}
+
+    # new-task: run-shell command carries pid through every quoting layer.
+    app.open_menu(row)
+    time.sleep(0.5)
+    os.write(fd_a, b"n")
+    got = wait_for(lambda: os.path.getsize(argv_log) > 0, 5.0)
+    raw = open(argv_log, "rb").read() if os.path.exists(argv_log) else b""
+    argv = raw.split(b"\0")[:-1] if raw else []
+    check(got and argv == [b"internal", b"new-task", nasty_pid.encode()],
+          "menu quoting: run-shell preserves $ # quotes backslash and spaces",
+          argv)
+
+    # close-task: two nasty arguments survive the same path.
+    open(argv_log, "w").close()
+    app.open_menu(row)
+    time.sleep(0.5)
+    os.write(fd_a, b"d")
+    got = wait_for(lambda: os.path.getsize(argv_log) > 0, 5.0)
+    raw = open(argv_log, "rb").read() if os.path.exists(argv_log) else b""
+    argv = raw.split(b"\0")[:-1] if raw else []
+    check(got and argv == [b"internal", b"close-task",
+                           nasty_pid.encode(), b"t_x"],
+          "menu quoting: close-task preserves the same characters", argv)
+
+    # editor popup: the worktree path is the popup's cwd.
+    app.open_menu(row)
+    time.sleep(0.5)
+    os.write(fd_a, b"o")
+    got = wait_for(lambda: os.path.exists(editor_log), 5.0)
+    text = open(editor_log, encoding="utf-8").read() if got else ""
+    check(got and ("cwd=" + nasty_path) in text,
+          "menu quoting: editor popup opens in the exact worktree path", text)
+finally:
+    for fd in (fd_a, fd_b):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    for pid in children:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+    for pid in children:
+        try:
+            os.waitpid(pid, 0)
+        except (ChildProcessError, OSError):
+            pass
+    for pane in (pane_a, pane_b, pane_c):
+        if pane:
+            run(*tmux, "kill-window", "-t", pane)
+    run(*tmux, "kill-session", "-t", "view2")
+
+sys.exit(0 if checks and all(checks) else 1)
+PY
+
+if ((CLIENT_RC == 0)); then
+  _pass "ui: client targeting and menu/popup quoting (real pty)"
+else
+  _fail "ui: client targeting and menu/popup quoting (real pty)" \
+    "$(tail -n 40 "$CLIENT_OUT")"
+fi
 
 # ---------------------------------------------------------------------------
 # Terminal restore on SIGTERM and EOF (real pty)

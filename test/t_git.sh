@@ -594,6 +594,16 @@ assert_eq "true" "$(jq -r 'has("error")' <<<"$CAP_OUT")" "status: failure object
 capture git_status_json "$(new_tmpdir)/nope"
 assert_eq "2" "$CAP_RC" "status: missing path exits 2"
 assert_eq "true" "$(jq -r 'has("error")' <<<"$CAP_OUT")" "status: missing-path object has error"
+capture run_balamba internal status "$(new_tmpdir)/nope"
+assert_eq "2" "$CAP_RC" "internal status: missing path exits 2"
+assert_eq "1" "$(jq -s 'length' <<<"$CAP_OUT")" \
+  "internal status: missing path prints exactly one JSON object"
+assert_eq "true" "$(jq -r 'has("path") and has("error")' <<<"$CAP_OUT")" \
+  "internal status: missing path object has path and error"
+capture run_balamba internal status "$(new_tmpdir)"
+assert_eq "2" "$CAP_RC" "internal status: non-repo directory exits 2"
+assert_eq "true" "$(jq -r 'has("error")' <<<"$CAP_OUT")" \
+  "internal status: non-repo directory object has error"
 capture git_status_json
 assert_eq "2" "$CAP_RC" "status: missing argument exits 2"
 

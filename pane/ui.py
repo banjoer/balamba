@@ -959,6 +959,56 @@ def pane_window_state(pane_id):
     return active, index
 
 
+def list_clients():
+    """Client names attached to the private server (empty when detached)."""
+    out = tmux_run(["list-clients", "-F", "#{client_name}"], timeout=2)
+    if not out:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _client_rows():
+    """``(client_name, window_id, pane_id)`` for every attached client."""
+    out = tmux_run(
+        ["list-clients", "-F", "#{client_name}\t#{window_id}\t#{pane_id}"],
+        timeout=2)
+    rows = []
+    if not out:
+        return rows
+    for line in out.splitlines():
+        pieces = line.split("\t")
+        if len(pieces) < 3:
+            continue
+        rows.append((pieces[0], pieces[1], pieces[2]))
+    return rows
+
+
+def client_for_pane(pane_id):
+    """The attached client currently displaying ``pane_id``'s window.
+
+    ``display-popup``/``display-menu`` opened from a background pane have no
+    client context of their own; without ``-c`` tmux may pick the wrong client
+    when several are attached.  Prefer a client whose active pane is the pane
+    itself, then any client viewing the same window.  Returns ``None`` when no
+    client is attached (the callers then skip the UI instead of failing).
+    """
+    if not pane_id:
+        return None
+    window = tmux_run(["display", "-p", "-t", pane_id, "#{window_id}"])
+    if not window:
+        return None
+    window = window.strip()
+    fallback = None
+    for client, client_window, active_pane in _client_rows():
+        if client_window != window:
+            continue
+        if active_pane == pane_id:
+            return client
+        if fallback is None:
+            fallback = client
+    return fallback
+
+
 def list_windows():
     """Map tab id -> {window, flag, active} plus the active window index."""
     # One process for all windows (spike 4): index, tab id, activity, active.
@@ -1179,7 +1229,6 @@ class UIApp:
         self.parser_buf = b""
         self.esc_deadline = None
         self.children = []
-        self.pending = []
 
         # tree
         self.rows = []
@@ -1352,26 +1401,8 @@ class UIApp:
         self.next_poll = min(self.next_poll, time.monotonic() + 0.2)
         return proc
 
-    def schedule(self, argv, delay=0.0):
-        if delay <= 0:
-            self.spawn(argv)
-        else:
-            self.pending.append((time.monotonic() + delay, argv))
-
     def internal(self, *args):
         return [self.bin, "internal"] + [str(a) for a in args]
-
-    def run_pending(self):
-        if not self.pending:
-            return
-        now = time.monotonic()
-        ready = []
-        keep = []
-        for due, argv in self.pending:
-            (ready if now >= due else keep).append((due, argv))
-        self.pending = keep
-        for _due, argv in ready:
-            self.spawn(argv)
 
     def reap(self):
         alive = []
@@ -1386,7 +1417,15 @@ class UIApp:
     def open_popup(self, command, cwd=None):
         if not os.environ.get("TMUX"):
             return
-        args = ["tmux", "display-popup", "-E", "-w", "90%", "-h", "85%"]
+        client = client_for_pane(self.pane_id)
+        if not client:
+            # No attached client: a popup has nowhere to appear.  Stay quiet
+            # instead of surfacing a tmux error from a background action.
+            return
+        args = ["tmux", "display-popup", "-c", client, "-E",
+                "-w", "90%", "-h", "85%"]
+        if self.pane_id:
+            args += ["-t", self.pane_id]
         if cwd:
             args += ["-d", cwd]
         args.append(command)
@@ -1401,10 +1440,13 @@ class UIApp:
     def open_menu(self, row):
         if not os.environ.get("TMUX"):
             return
+        client = client_for_pane(self.pane_id)
+        if not client:
+            return
         items = menu_items_for_row(row, self.state)
         pid = row.get("pid") if row else None
         context = row.get("context") if row else None
-        args = ["tmux", "display-menu", "-T", tmux_format_escape(
+        args = ["tmux", "display-menu", "-c", client, "-T", tmux_format_escape(
             "balamba" if not row else "balamba · %s" % row.get("name"))]
         if self.pane_id:
             args += ["-t", self.pane_id]
@@ -1414,35 +1456,24 @@ class UIApp:
                 path = row.get("path") if row else None
                 if not path:
                     continue
-                command = "tmux display-popup -E -w 90%% -h 85%% -d %s %s" % (
-                    shell_quote(path),
-                    self.config.get("editor") or "vi",
-                )
+                command = ("display-popup -c %s -E -w 90%% -h 85%%"
+                           " -d %s %s") % (
+                               shell_quote(client),
+                               shell_quote(path),
+                               self.config.get("editor") or "vi",
+                           )
                 args += [tmux_format_escape(label), key, command]
                 continue
             full = list(argv)
             if full[:1] == ["internal"] and pid:
-                # Menu actions must apply to the clicked context, not only the
-                # active one; activating first is cheap and idempotent.
+                # Pass the clicked project/context explicitly: the CLI then
+                # never depends on whichever context happens to be active
+                # (no activate-then-delay race).
                 if full[1:2] == ["new-task"]:
-                    if self._selected_needs_activate(pid, "proj"):
-                        command = (
-                            sh_join(self.internal("activate", pid, "proj"))
-                            + " && "
-                            + sh_join(self.internal("new-task"))
-                        )
-                    else:
-                        command = sh_join(self.internal("new-task"))
+                    command = sh_join(self.internal("new-task", pid))
                 elif full[1:2] == ["new-terminal"]:
-                    target_ctx = context or "proj"
-                    if self._selected_needs_activate(pid, target_ctx):
-                        command = (
-                            sh_join(self.internal("activate", pid, target_ctx))
-                            + " && "
-                            + sh_join(self.internal("new-terminal"))
-                        )
-                    else:
-                        command = sh_join(self.internal("new-terminal"))
+                    command = sh_join(
+                        self.internal("new-terminal", pid, context or "proj"))
                 else:
                     command = sh_join(self.internal(*full[1:]))
             else:
@@ -1451,13 +1482,6 @@ class UIApp:
                 tmux_format_escape(command))
             args += [tmux_format_escape(label), key, item_cmd]
         self.spawn(args, track=False)
-
-    def _selected_needs_activate(self, pid, context):
-        if not self.state:
-            return False
-        active = self.state.get("active") or {}
-        return not (active.get("project") == pid
-                    and active.get("context") == context)
 
     # -- tree actions -------------------------------------------------------
     def current_row(self):
@@ -1495,11 +1519,10 @@ class UIApp:
             pid = (self.state.get("active") or {}).get("project")
         if not pid:
             return
-        if self._selected_needs_activate(pid, "proj"):
-            self.schedule(self.internal("activate", pid, "proj"))
-            self.schedule(self.internal("new-task"), delay=0.35)
-        else:
-            self.spawn(self.internal("new-task"))
+        # One command, with the project named explicitly.  This used to
+        # activate first and delay new-task by 0.35s, which raced whenever the
+        # selected row was not the active context.
+        self.spawn(self.internal("new-task", pid))
 
     def new_terminal(self):
         row = self.current_row()
@@ -1507,11 +1530,11 @@ class UIApp:
             return
         pid = row.get("pid")
         context = row.get("context") or "proj"
-        if self._selected_needs_activate(pid, context):
-            self.schedule(self.internal("activate", pid, context))
-            self.schedule(self.internal("new-terminal"), delay=0.35)
-        else:
-            self.spawn(self.internal("new-terminal"))
+        if not pid:
+            return
+        # Same rule as new_task: name the target context, do not activate
+        # first and hope the next command happens after the state write.
+        self.spawn(self.internal("new-terminal", pid, context))
 
     def close_task(self):
         row = self.current_row()
@@ -1987,10 +2010,6 @@ class UIApp:
                     self.dirty = True
                 now = time.monotonic()
                 timeout = max(0.0, self.next_poll - now)
-                if self.pending:
-                    due = min(item[0] for item in self.pending)
-                    delay = max(0.0, due - now)
-                    timeout = delay if timeout is None else min(timeout, delay)
                 if self.esc_deadline is not None:
                     delay = max(0.0, self.esc_deadline - now)
                     timeout = delay if timeout is None else min(timeout, delay)
@@ -2031,7 +2050,6 @@ class UIApp:
                     self._handle_events()
                     self._flush_esc()
 
-                self.run_pending()
                 self.reap()
 
                 now = time.monotonic()

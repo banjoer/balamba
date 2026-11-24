@@ -269,6 +269,12 @@ assert_eq "1" "$(session_count)" "ensure_session: exactly one session"
 assert_status 0 "ensure_session: idempotent" tmux_ensure_session
 assert_eq "1" "$(session_count)" "ensure_session: still one session"
 assert_eq "1" "$(window_count)" "ensure_session: empty workspace has one window"
+assert_eq "prefix C-a" "$(tsess show-options -g prefix | sed 's/[[:space:]]*$//')" \
+  "cold start: the private server loaded tmux.conf (prefix C-a)"
+assert_eq "on" "$(tsess show-options -gv mouse)" \
+  "cold start: mouse is on from tmux.conf"
+assert_eq "on" "$(tsess show-options -gv monitor-activity)" \
+  "cold start: monitor-activity is on from tmux.conf"
 
 # Stale socket: a regular file where the socket belongs must be replaced.
 tsess kill-server >/dev/null 2>&1 || true
@@ -338,6 +344,17 @@ assert_contains "$agent_cwd" "$ALPHA" "open_tab: agent cwd is the project path"
 assert_contains "$agent_args" "--session $agent_ses" "open_tab: agent argv carries the stored session"
 assert_contains "$agent_args" "ses_" "open_tab: agent args carry a ses_ id"
 assert_not_contains "$agent_args" "--standalone" "open_tab: agent args have no --standalone"
+
+# Agent create vs resume templates: restore uses BALAMBA_AGENT_RESUME.
+_resume_saved=${BALAMBA_AGENT_RESUME[fakeagent]-}
+BALAMBA_AGENT_RESUME[fakeagent]='fake-resume --session {{session}} --dir {{dir}}'
+assert_eq "fake-resume --session ses_abc --dir /tmp" \
+  "$(_tmux_pane_command agent fakeagent ses_abc /tmp 1)" \
+  "agent: resume uses BALAMBA_AGENT_RESUME"
+assert_eq "$AGENT_SCRIPT $AGENT_LOG --session ses_abc --dir /tmp" \
+  "$(_tmux_pane_command agent fakeagent ses_abc /tmp 0)" \
+  "agent: create uses BALAMBA_AGENT_COMMAND"
+BALAMBA_AGENT_RESUME[fakeagent]=$_resume_saved
 
 # ---------------------------------------------------------------------------
 # Context isolation and activation

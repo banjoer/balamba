@@ -393,13 +393,29 @@ _task_assess_summary() {
 _task_menu() {
   local client=$1 title=$2
   shift 2
-  local -a args=(display-menu -c "$client" -T "$(_task_fmt_escape "$title")")
+  local fitted
+  fitted=$(_task_fit_title "$title")
+  local -a args=(display-menu -c "$client" -T "$fitted")
   args+=("$@")
   if ! _tmux "${args[@]}" >/dev/null 2>&1; then
     balamba_warn "could not display a menu on client $client"
     return 2
   fi
   return 0
+}
+
+# tmux 3.4 silently refuses to show a display-menu whose title is wider than
+# the client (a long close summary used to make the whole dialog vanish).
+# Fit the title to a safe width while keeping the warning words.
+_TASK_MENU_TITLE_MAX=100
+_task_fit_title() {
+  local title=${1-}
+  title=$(_task_fmt_escape "$title")
+  if ((${#title} > _TASK_MENU_TITLE_MAX)); then
+    printf '%s…' "${title:0:$((_TASK_MENU_TITLE_MAX - 1))}"
+  else
+    printf '%s' "$title"
+  fi
 }
 
 _task_kind_menu() {

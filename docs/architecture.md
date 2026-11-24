@@ -85,7 +85,7 @@ Every variable above can be overridden from the environment. Tests set them to
 a throwaway tree. `balamba_tmux_socket_path` prints
 `${TMUX_TMPDIR:-/tmp}/tmux-<uid>/<BALAMBA_SOCKET>`.
 
-Required commands: `bash` >= 4.2, `tmux` (tested on 3.4), `python3` >= 3.6,
+Required commands: `bash` >= 4.2, `tmux` (tested on 3.4), `python3` >= 3.8,
 `jq`, `git`, `flock`. `opencode` is optional at runtime (shell terminals still
 work); `doctor` reports its absence as a warning.
 
@@ -110,9 +110,10 @@ re-enables it.
 | `editor` | `${EDITOR:-vi}` | editor for `e` / editor popups |
 | `default_ref` | `origin/main` | prefilled "create from" ref |
 | `default_agent` | `opencode` | agent key used for agent tabs |
+| `restore_stagger` | `1` | seconds between staggered agent launches on restore (0 disables) |
 
-Widths must be 5–200; refresh values 1–3600. `balamba_config_validate` reports
-each problem on stderr and exits 2.
+Widths must be 5–200; refresh values 1–3600; restore_stagger 0–60.
+`balamba_config_validate` reports each problem on stderr and exits 2.
 
 ### 4.2 Agents
 
@@ -135,8 +136,10 @@ BALAMBA_AGENT_LABEL[myagent]='myagent'
 ```
 
 Note from the spikes: opencode requires ids beginning with `ses`; balamba
-generates `ses_` + 32 hex (`balamba_ses_id`). Use the same command for create
-and resume; opencode creates the session on the first message.
+generates `ses_` + 32 hex (`balamba_ses_id`). `BALAMBA_AGENT_COMMAND` is used
+for a new tab, `BALAMBA_AGENT_RESUME` for a rebuild after restore; an empty
+resume template falls back to the command. opencode creates the session on the
+first message, so its two templates are identical.
 
 Optional agent variables may be added later; keep this table updated if so.
 
@@ -384,9 +387,9 @@ the UI.
 
 | Verb | Args | Delegates to | Notes |
 |---|---|---|---|
-| `new-task` | — | `task_new_flow <active-project>` | requires `lib/task.sh` |
+| `new-task` | `[project-id]` | `task_new_flow <project-id>` | omitted = active project; explicit id avoids an activate race |
 | `add-project` | — | `project_add_flow` | optional function; required for `C-a P` |
-| `new-terminal` | — | `terminal_new_flow <active-project> <active-context>` | requires `lib/task.sh` |
+| `new-terminal` | `[project-id] [context]` | `terminal_new_flow <project-id> <context>` | omitted = active project/context |
 | `close-task` | `<project-id> <task-id>` | `task_close_flow` | requires `lib/task.sh` |
 | `activate` | `<project-id> <context> [window]` | `tmux_activate` | requires `lib/tmux.sh` |
 | `expand` | `<project-id> [task-id]` | state update | implemented here; no lib needed |
@@ -406,7 +409,7 @@ warn  opencode service   stopped (agents may start it on demand)
 fail  jq                 not found on PATH
 ```
 
-Checks: bash >= 4.2; tmux presence/version; python3 >= 3.6; jq; git; flock;
+Checks: bash >= 4.2; tmux presence/version; python3 >= 3.8; jq; git; flock;
 opencode version and `opencode service status` (service down is a **warning**);
 config syntax/sourcing/range validation; state validity or "not created yet";
 existence of project/task paths in a valid state (missing = warning); private
@@ -628,7 +631,9 @@ Rebuild the whole UI from state (cold start). Condensed validated recipe:
    unlink and retry once.
 3. Create session `balamba` if absent. `new-session -d -s balamba -n <first
    tab>` creates the first window; reuse that window for the first saved tab
-   (or kill a placeholder window before rebuilding).
+   (or kill a placeholder window before rebuilding).  The first `new-session`
+   is what actually starts the server, so it must carry `-f $BALAMBA_TMUX_CONF`
+   (a bare `start-server` exits with no session and loses the config).
 4. For each saved window in ascending index order: create with
    `new-window -d -t balamba: -n <name>` (the trailing colon avoids name/index
    ambiguity), add `pane_count + 1` content/chrome panes with plain splits.
@@ -825,6 +830,10 @@ and continue polling.
   per check, not one process per window.
 - Git pane: only while its window is active, every `@balamba_git_refresh`
   (2 s), plus on focus (`ESC[I` with `focus-events on` + `ESC[?1004h`).
+- A window that becomes active receives no focus event in its non-focused chrome
+  panes (spike 4).  `tmux.sh` installs a `session-window-changed`/`client-attached`
+  hook that sends a synthetic focus-in to that window's tree/git panes, so the
+  git pane refreshes immediately instead of after `idle_refresh`.
 - Unread dots come from `window_activity_flag` (requires `monitor-activity on`,
   already in `tmux.conf`); do not invent custom unread state.
 - The tree renders projects → tasks → tabs. Active project expanded; manual
@@ -870,7 +879,8 @@ avoids fork storms.
 - Empty context (project/task with no tabs): exactly one shell tab on first
   activation. Never leave an empty window.
 - Chrome widths are per-window and drift; reassert after attach, on activation,
-  and after a layout restore. `window-resized` does not fire for border drags.
+  and after a layout restore. `window-resized` does not fire for border drags, so
+  `MouseDragEnd1Border` is also bound to the width reassert helper.
 - No `pane-border-status`, no extra toolbars, no per-window status extras.
 
 ---
@@ -918,10 +928,12 @@ The full validated procedure is §10.6. The essential ordering, from
 
 ## 16. Testing and part-2 status
 
-`./test/run.sh` creates an isolated `HOME`/XDG tree, a throwaway
-`TMUX_TMPDIR`/socket, runs `bash -n` on every shell file, then each
-`test/t_*.sh`. It exits non-zero on any failure. `BALAMBA_TEST_KEEP=1` preserves
-the temp environment.
+`./test/run.sh` creates one isolated `HOME`/XDG tree and a throwaway
+`TMUX_TMPDIR`/socket for the whole run, runs `bash -n` on every shell file, then
+each `test/t_*.sh`. It exits non-zero on any failure. `BALAMBA_TEST_KEEP=1`
+preserves the temp environment. `test/t_e2e.sh` drives a real attached client
+under a pty (`test/e2e_driver.py`); it owns only its own socket cleanup and
+leaves the shared temp root to the runner.
 
 Part 2 ships and tests: slug/ids, state init/get/update/validate, concurrent
 writers, failed-jq safety, config defaults/overrides/validation, `doctor` with

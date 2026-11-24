@@ -34,7 +34,7 @@ balamba_test_env_init() {
   export GIT_CONFIG_GLOBAL="$root/gitconfig"
   export GIT_TERMINAL_PROMPT=0
 
-  unset TMUX EDITOR VISUAL BALAMBA_TMUX_CONF 2>/dev/null || true
+  unset TMUX EDITOR VISUAL BALAMBA_TMUX_CONF BALAMBA_RESTORE_STAGGER 2>/dev/null || true
 
   mkdir -p -- "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" \
     "$XDG_RUNTIME_DIR" "$BALAMBA_RUNTIME" "$TMUX_TMPDIR"

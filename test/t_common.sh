@@ -117,6 +117,7 @@ assert_eq "2" "$git_refresh" "config: default git_refresh"
 assert_eq "vi" "$editor" "config: default editor falls back to vi"
 assert_eq "origin/main" "$default_ref" "config: default_ref"
 assert_eq "opencode" "$default_agent" "config: default agent"
+assert_eq "1" "$restore_stagger" "config: default restore_stagger"
 assert_eq "opencode --session {{session}}" \
   "${BALAMBA_AGENT_COMMAND[opencode]-}" "config: opencode command template"
 assert_eq "opencode --session {{session}}" \
@@ -149,6 +150,11 @@ assert_status 0 "config: overrides validate" balamba_config_validate
 
 printf 'tree_width=wide\n' >"$BALAMBA_CONFIG"
 assert_status 2 "config: non-numeric width is rejected" balamba_config_validate
+printf 'restore_stagger=lots\n' >"$BALAMBA_CONFIG"
+assert_status 2 "config: non-numeric restore_stagger is rejected" balamba_config_validate
+printf 'restore_stagger=99\n' >"$BALAMBA_CONFIG"
+assert_status 2 "config: restore_stagger above 60 is rejected" balamba_config_validate
+printf 'tree_width=wide\n' >"$BALAMBA_CONFIG"
 bad_doctor_out=""
 bad_doctor_rc=0
 bad_doctor_out=$("$BALAMBA_BIN" doctor 2>&1) || bad_doctor_rc=$?

@@ -42,6 +42,19 @@ _tmux() {
   command tmux -L "$BALAMBA_SOCKET" "$@"
 }
 
+# `new-session` is the command that starts a cold server.  A bare
+# `start-server` exits immediately when there is no session, so the server that
+# actually survives must be the one started by new-session: pass -f here or the
+# private server runs with the user's/default tmux config (wrong prefix, no
+# mouse, no monitor-activity).
+_tmux_new_session() {
+  local -a conf=()
+  if [[ -n ${BALAMBA_TMUX_CONF-} && -f $BALAMBA_TMUX_CONF ]]; then
+    conf=(-f "$BALAMBA_TMUX_CONF")
+  fi
+  _tmux "${conf[@]}" new-session "$@"
+}
+
 _tmux_session_exists() {
   _tmux has-session -t "$_BALAMBA_TMUX_SESSION" >/dev/null 2>&1
 }
@@ -80,11 +93,19 @@ _tmux_chrome_command() {
   printf '%q %q %s\n' "$py" "$BALAMBA_ROOT/pane/ui.py" "$which"
 }
 
-# Launch command for one content pane.  <kind> is shell|agent.
+# Launch command for one content pane.  <kind> is shell|agent; resume=1 picks
+# BALAMBA_AGENT_RESUME (restore) instead of BALAMBA_AGENT_COMMAND (create).
 _tmux_pane_command() {
-  local kind=$1 agent=${2-} session=${3-} dir=${4-}
+  local kind=$1 agent=${2-} session=${3-} dir=${4-} resume=${5:-0}
   if [[ $kind == agent && -n $session ]]; then
-    local tmpl=${BALAMBA_AGENT_COMMAND[$agent]-}
+    local tmpl=""
+    if ((resume)); then
+      tmpl=${BALAMBA_AGENT_RESUME[$agent]-}
+      if [[ -z $tmpl && -n ${default_agent-} ]]; then
+        tmpl=${BALAMBA_AGENT_RESUME[$default_agent]-}
+      fi
+    fi
+    [[ -n $tmpl ]] || tmpl=${BALAMBA_AGENT_COMMAND[$agent]-}
     if [[ -z $tmpl && -n ${default_agent-} ]]; then
       tmpl=${BALAMBA_AGENT_COMMAND[$default_agent]-}
     fi
@@ -125,6 +146,7 @@ _tmux_write_hook_script() {
     printf '%s\n' 'case ${1-} in'
     printf '%s\n' '  save)    tmux_save_runtime ;;'
     printf '%s\n' '  widths)  shift; tmux_assert_widths "${1-}" ;;'
+    printf '%s\n' '  nudge)   shift; tmux_nudge_window "${1-}" ;;'
     printf '%s\n' '  respawn) tmux_respawn_dead_chrome ;;'
     printf '%s\n' 'esac'
   } >"$path" 2>/dev/null || return 0
@@ -139,14 +161,26 @@ _tmux_install_hooks() {
   script=$(_tmux_write_hook_script)
   [[ -n $script ]] || return 0
 
-  local qsaved qwidth qrespawn
+  local qsaved qwidth qrespawn qnudge
   qsaved=$(_tmux_dq "$script save")
   qwidth=$(_tmux_dq "$script widths")
   qrespawn=$(_tmux_dq "$script respawn")
+  qnudge=$(_tmux_dq "$script nudge")
 
   _tmux set-hook -g 'client-detached[80]' "run-shell -b $qsaved" >/dev/null 2>&1 || true
   _tmux set-hook -g 'window-resized[80]' "run-shell -b $qwidth #{window_id}" >/dev/null 2>&1 || true
   _tmux set-hook -g 'pane-died[80]' "run-shell -b $qrespawn" >/dev/null 2>&1 || true
+  # A pane in a window that becomes active receives no focus event (spike 4),
+  # so the git pane would otherwise wait up to idle_refresh for fresh status.
+  # Nudge its own focus handler as soon as the window is switched to; same on
+  # attach, when the client becomes visible.
+  _tmux set-hook -g 'session-window-changed[81]' \
+    "run-shell -b $qnudge #{window_id}" >/dev/null 2>&1 || true
+  _tmux set-hook -g 'client-attached[81]' "run-shell -b $qnudge" >/dev/null 2>&1 || true
+  # Mouse border drags do not fire window-resized (spike 4); once the drag
+  # ends, reassert the configured sidebar widths.
+  _tmux bind-key -T root MouseDragEnd1Border \
+    "run-shell -b $qwidth #{window_id}" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -197,7 +231,7 @@ tmux_server_up() {
 _tmux_session_new_with_window() {
   local name=$1 cwd=$2
   _tmux_session_size
-  if ! _tmux new-session -d -s "$_BALAMBA_TMUX_SESSION" -n "$name" \
+  if ! _tmux_new_session -d -s "$_BALAMBA_TMUX_SESSION" -n "$name" \
     -x "$_TMUX_COLS" -y "$_TMUX_ROWS" -c "$cwd" 'sleep 300' \
     >/dev/null 2>&1; then
     if _tmux_session_exists; then
@@ -205,7 +239,7 @@ _tmux_session_new_with_window() {
       :
     else
       rm -f -- "$(balamba_tmux_socket_path)"
-      _tmux new-session -d -s "$_BALAMBA_TMUX_SESSION" -n "$name" \
+      _tmux_new_session -d -s "$_BALAMBA_TMUX_SESSION" -n "$name" \
         -x "$_TMUX_COLS" -y "$_TMUX_ROWS" -c "$cwd" 'sleep 300' \
         >/dev/null 2>&1 || \
         balamba_die "could not create tmux session $_BALAMBA_TMUX_SESSION"
@@ -238,6 +272,7 @@ _tmux_new_placeholder_window() {
   _FW_LAUNCHED=(shell)
   _FW_AGENT=""
   _FW_SESSION=""
+  _FW_RESUME=0
   _tmux_fill_window "$win" >/dev/null 2>&1 || true
   _tmux set-option -w -t "$win" @balamba_placeholder 1 >/dev/null 2>&1 || true
   tmux_assert_widths "$win" >/dev/null 2>&1 || true
@@ -246,11 +281,11 @@ _tmux_new_placeholder_window() {
 
 _tmux_new_placeholder_session() {
   _tmux_session_size
-  if ! _tmux new-session -d -s "$_BALAMBA_TMUX_SESSION" \
+  if ! _tmux_new_session -d -s "$_BALAMBA_TMUX_SESSION" \
     -n "$_BALAMBA_TMUX_SESSION" -x "$_TMUX_COLS" -y "$_TMUX_ROWS" \
     -c "$HOME" 'sleep 300' >/dev/null 2>&1; then
     rm -f -- "$(balamba_tmux_socket_path)"
-    _tmux new-session -d -s "$_BALAMBA_TMUX_SESSION" \
+    _tmux_new_session -d -s "$_BALAMBA_TMUX_SESSION" \
       -n "$_BALAMBA_TMUX_SESSION" -x "$_TMUX_COLS" -y "$_TMUX_ROWS" \
       -c "$HOME" 'sleep 300' >/dev/null 2>&1 || \
       balamba_die "could not create tmux session $_BALAMBA_TMUX_SESSION"
@@ -273,6 +308,7 @@ _tmux_new_placeholder_session() {
   _FW_LAUNCHED=(shell)
   _FW_AGENT=""
   _FW_SESSION=""
+  _FW_RESUME=0
   _tmux_fill_window "$win" >/dev/null 2>&1 || true
   _tmux set-option -w -t "$win" @balamba_placeholder 1 >/dev/null 2>&1 || true
   tmux_assert_widths "$win" >/dev/null 2>&1 || true
@@ -423,6 +459,33 @@ _tmux_respawn_content_pane() {
   return 0
 }
 
+# Nudge the chrome panes of a window (or the current window when no target is
+# given) with a synthetic focus-in event.  pane/ui.py treats that as "refresh
+# now", which is how the git pane becomes fresh immediately after a window
+# switch without polling every inactive window at 1 Hz.
+tmux_nudge_window() {
+  local target=${1-}
+  _tmux_server_responsive || return 0
+  local -a rows=()
+  local row pane chrome
+  if [[ -n $target ]]; then
+    mapfile -t rows < <(_tmux list-panes -t "$target" \
+      -F $'#{pane_id}\t#{@balamba_chrome}' 2>/dev/null || true)
+  else
+    mapfile -t rows < <(_tmux list-panes -t "$_BALAMBA_TMUX_SESSION:" \
+      -F $'#{pane_id}\t#{@balamba_chrome}' 2>/dev/null || true)
+  fi
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r pane chrome <<<"$row"
+    case $chrome in
+      tree|git)
+        _tmux send-keys -t "$pane" -l $'\x1b[I' >/dev/null 2>&1 || true
+        ;;
+    esac
+  done
+  return 0
+}
+
 # Respawn every chrome pane that has remain-on-exit'ed (pane-died hook).
 # Content panes are intentionally left alone.
 tmux_respawn_dead_chrome() {
@@ -466,6 +529,7 @@ _FW_CWDS=()
 _FW_LAUNCHED=()
 _FW_AGENT=""
 _FW_SESSION=""
+_FW_RESUME=0
 
 _TMUX_STAGGER_SECS=0
 _TMUX_AGENT_LAUNCHES=0
@@ -538,7 +602,7 @@ _tmux_fill_window() {
     if [[ $kind == agent && -z ${_FW_SESSION-} ]]; then
       kind=shell
     fi
-    cmd=$(_tmux_pane_command "$kind" "${_FW_AGENT-}" "${_FW_SESSION-}" "$cwd")
+    cmd=$(_tmux_pane_command "$kind" "${_FW_AGENT-}" "${_FW_SESSION-}" "$cwd" "$_FW_RESUME")
     if [[ $kind == agent && $_TMUX_AGENT_LAUNCHES -gt 0 && $_TMUX_STAGGER_SECS -gt 0 ]]; then
       sleep "$_TMUX_STAGGER_SECS"
     fi
@@ -607,6 +671,7 @@ _tmux_set_fill_globals_from_tab() {
   _FW_LAUNCHED=("${launched[@]}")
   _FW_AGENT=$agent
   _FW_SESSION=$session
+  _FW_RESUME=1
   _TMUX_TAB_NAME=$name
   _TMUX_TAB_ID=$tab_id
   _TMUX_TAB_CONTEXT=$context
@@ -1042,6 +1107,7 @@ _tmux_create_tab() {
   _FW_LAUNCHED=("$launched")
   _FW_AGENT=$agent
   _FW_SESSION=$session
+  _FW_RESUME=0
   _tmux_fill_window "$win" >/dev/null 2>&1 || true
 
   local final_index layout
