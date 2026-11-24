@@ -39,7 +39,8 @@ usage: balamba [command] [args]
 Commands
   (none), attach              attach to the balamba tmux session (restore if needed)
   project add <path>          add a git main checkout as a project
-  project remove <path|id>    remove a project from balamba (never touches files)
+  project remove <path|id> [--force]
+                              remove a project from balamba (never touches files)
   project list                list projects
   task list [project-id]      list tasks (optionally one project)
   save                        save live tmux layout/cwd state to state.json
@@ -126,13 +127,20 @@ cmd_project_add() {
 }
 
 cmd_project_remove() {
-  (($# == 1)) || usage_error "usage: balamba project remove <path|id>"
-  local target=$1
+  (($# == 1 || $# == 2)) || \
+    usage_error "usage: balamba project remove <path|id> [--force]"
+  local target=$1 force=${2-}
+  if [[ -n $force && $force != --force ]]; then
+    usage_error "usage: balamba project remove <path|id> [--force]"
+  fi
   balamba_require_func git_project_remove lib/git.sh "project remove"
   balamba_state_init
 
+  local -a args=("$target")
+  [[ $force == --force ]] && args+=(--force)
+
   local id rc=0
-  id=$(git_project_remove "$target") || rc=$?
+  id=$(git_project_remove "${args[@]}") || rc=$?
   ((rc == 0)) || exit "$rc"
   if declare -F tmux_remove_project >/dev/null 2>&1; then
     tmux_remove_project "$id" || true
