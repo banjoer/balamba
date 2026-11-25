@@ -22,6 +22,11 @@ The app is deliberately a small, poll-driven terminal program:
   configured active/idle interval; the git pane additionally refreshes its
   read-only status document every ``@balamba_git_refresh`` seconds.
 
+The palette is neutral with one accent (see ``Palette`` below); green/red are
+reserved for git file codes.  The tree collapses a single-pane tab to one row,
+renders a tab plus pane rows when a tab has splits, and pins a contextual
+footer with three or four honest key hints.
+
 Nothing here is a library for the shell code; the pure helpers at the top are
 kept importable so ``test/t_ui.py`` can exercise them directly.
 """
@@ -52,9 +57,250 @@ CONFIG_DEFAULTS = {
     "editor": "vi",
     "default_ref": "origin/main",
     "default_agent": "opencode",
+    "theme": "auto",
+    "accent": "blue",
 }
 
 REFRESH_KEYS = ("active_refresh", "idle_refresh", "git_refresh")
+
+# ---------------------------------------------------------------------------
+# Palette: neutral text plus one accent.  Green/red are reserved for git.
+# ---------------------------------------------------------------------------
+# 24-bit RGB per role (the brief's numbers).
+ROLE_RGB = {
+    "text": (201, 209, 217),       # #c9d1d9
+    "bright": (240, 246, 252),     # #f0f6fc
+    "dim": (110, 118, 129),        # #6e7681
+    "dimmer": (72, 79, 88),        # #484f58
+    "unread": (210, 153, 34),      # #d29922
+    "add": (63, 185, 80),          # #3fb950
+    "modify": (210, 153, 34),      # #d29922
+    "delete": (248, 81, 73),       # #f85149
+    "selbg": (28, 33, 40),         # #1c2128
+}
+
+# 256-colour fallback (252/231/244/238/178/71/178/203/236).
+ROLE_256 = {
+    "text": 252,
+    "bright": 231,
+    "dim": 244,
+    "dimmer": 238,
+    "unread": 178,
+    "add": 71,
+    "modify": 178,
+    "delete": 203,
+    "selbg": 236,
+}
+
+# 16-colour fallback: plain ANSI foreground/background codes.
+ROLE_16 = {
+    "text": 37,
+    "bright": 97,
+    "dim": 90,
+    "dimmer": 90,
+    "unread": 33,
+    "add": 32,
+    "modify": 33,
+    "delete": 31,
+    "selbg": 100,
+}
+
+# The accent is the one saturated colour in the UI.  Blue is the default.
+ACCENT_RGB = {
+    "blue": (88, 166, 255),
+    "cyan": (57, 197, 207),
+    "magenta": (188, 140, 255),
+    "yellow": (227, 179, 65),
+}
+ACCENT_256 = {"blue": 75, "cyan": 80, "magenta": 141, "yellow": 178}
+ACCENT_16 = {"blue": 34, "cyan": 36, "magenta": 35, "yellow": 33}
+
+THEME_MODES = ("truecolor", "256", "16")
+ACCENT_NAMES = ("blue", "cyan", "magenta", "yellow")
+
+
+def detect_theme(theme, env=None):
+    """Resolve ``auto|truecolor|256|16`` against COLORTERM/TERM."""
+    theme = str(theme or "auto").strip().lower()
+    if theme in THEME_MODES:
+        return theme
+    env = env if env is not None else os.environ
+    colorterm = str(env.get("COLORTERM") or "").lower()
+    term = str(env.get("TERM") or "").lower()
+    if "truecolor" in colorterm or "24bit" in colorterm:
+        return "truecolor"
+    if "256color" in term:
+        return "256"
+    return "16"
+
+
+def normalize_accent(accent):
+    accent = str(accent or "").strip().lower()
+    return accent if accent in ACCENT_NAMES else "blue"
+
+
+class Palette(object):
+    """Cached SGR builder.
+
+    Every attribute a row needs is computed once per palette, and every
+    ``style`` combination is memoised: the render loop never rebuilds the same
+    escape string twice, so a full repaint allocates only row text.
+    """
+
+    def __init__(self, theme, accent, env=None):
+        self.theme = detect_theme(theme, env)
+        self.accent = normalize_accent(accent)
+        self._cache = {}
+
+    # -- individual colours -------------------------------------------------
+    def _fg_code(self, role):
+        if role == "accent":
+            if self.theme == "truecolor":
+                return "38;2;%d;%d;%d" % ACCENT_RGB[self.accent]
+            if self.theme == "256":
+                return "38;5;%d" % ACCENT_256[self.accent]
+            return "%d" % ACCENT_16[self.accent]
+        if role not in ROLE_RGB:
+            role = "text"
+        if self.theme == "truecolor":
+            return "38;2;%d;%d;%d" % ROLE_RGB[role]
+        if self.theme == "256":
+            return "38;5;%d" % ROLE_256[role]
+        return "%d" % ROLE_16[role]
+
+    def _bg_code(self, role):
+        if role not in ROLE_RGB:
+            role = "selbg"
+        if self.theme == "truecolor":
+            return "48;2;%d;%d;%d" % ROLE_RGB[role]
+        if self.theme == "256":
+            return "48;5;%d" % ROLE_256[role]
+        return "%d" % ROLE_16[role]
+
+    # -- public cached builders --------------------------------------------
+    def fg(self, role):
+        key = ("fg", role)
+        value = self._cache.get(key)
+        if value is None:
+            value = "\x1b[" + self._fg_code(role) + "m"
+            self._cache[key] = value
+        return value
+
+    def bg(self, role="selbg"):
+        key = ("bg", role)
+        value = self._cache.get(key)
+        if value is None:
+            value = "\x1b[" + self._bg_code(role) + "m"
+            self._cache[key] = value
+        return value
+
+    def sgr(self, fg=None, bg=None, bold=False):
+        """Combined cached SGR: ``fg``/``bg`` roles plus optional bold."""
+        key = ("sgr", fg, bg, bool(bold))
+        value = self._cache.get(key)
+        if value is not None:
+            return value
+        codes = []
+        if fg:
+            codes.append(self._fg_code(fg))
+        if bg:
+            codes.append(self._bg_code(bg))
+        if bold:
+            codes.append("1")
+        value = "\x1b[" + ";".join(codes) + "m" if codes else ""
+        self._cache[key] = value
+        return value
+
+
+_DEFAULT_PALETTE = None
+
+
+def default_palette():
+    """Deterministic palette for pure rendering tests."""
+    global _DEFAULT_PALETTE
+    if _DEFAULT_PALETTE is None:
+        _DEFAULT_PALETTE = Palette("truecolor", "blue", {})
+    return _DEFAULT_PALETTE
+
+
+def make_palette(theme="auto", accent="blue", env=None):
+    return Palette(theme, accent, env)
+
+
+# ---------------------------------------------------------------------------
+# Glyphs: unicode by default, ASCII when the locale cannot encode them.
+# ---------------------------------------------------------------------------
+class Glyphs(object):
+    def __init__(self, ascii_only=False):
+        self.ascii = bool(ascii_only)
+        if self.ascii:
+            self.chevron_open = "v"
+            self.chevron_closed = ">"
+            self.agent = "A"
+            self.shell = "$"
+            self.pane = "-"
+            self.unread = "*"
+            self.select = "|"
+            self.rule = "-"
+            self.ellipsis = "~"
+            self.tl = "+"
+            self.tr = "+"
+            self.bl = "+"
+            self.br = "+"
+            self.h = "-"
+            self.v = "|"
+            self.ahead = ">"
+            self.behind = "<"
+        else:
+            self.chevron_open = "▾"
+            self.chevron_closed = "▸"
+            self.agent = "◆"
+            self.shell = "›"
+            self.pane = "·"
+            self.unread = "●"
+            self.select = "▌"
+            self.rule = "─"
+            self.ellipsis = "…"
+            self.tl = "╭"
+            self.tr = "╮"
+            self.bl = "╰"
+            self.br = "╯"
+            self.h = "─"
+            self.v = "│"
+            self.ahead = "↑"
+            self.behind = "↓"
+
+
+_DEFAULT_GLYPHS = None
+
+
+def default_glyphs():
+    global _DEFAULT_GLYPHS
+    if _DEFAULT_GLYPHS is None:
+        _DEFAULT_GLYPHS = Glyphs(False)
+    return _DEFAULT_GLYPHS
+
+
+def detect_ascii(env=None):
+    """True when the locale/terminal cannot be assumed to render UTF-8."""
+    env = env if env is not None else os.environ
+    for key in ("LC_ALL", "LC_CTYPE", "LANG"):
+        value = env.get(key)
+        if value:
+            lowered = str(value).lower()
+            return not ("utf-8" in lowered or "utf8" in lowered)
+    try:
+        encoding = (getattr(sys.stdout, "encoding", "") or "").lower()
+    except Exception:  # noqa: BLE001 - encoding query must never break paint
+        encoding = ""
+    if encoding:
+        return not ("utf-8" in encoding or "utf8" in encoding)
+    return False
+
+
+def make_glyphs(ascii_only=False):
+    return Glyphs(ascii_only)
+
 
 # ---------------------------------------------------------------------------
 # ANSI building blocks
@@ -76,6 +322,9 @@ CLEAR_SCREEN = "\x1b[2J"
 SGR_BOLD = "1"
 SGR_DIM = "2"
 SGR_REVERSE = "7"
+
+# Legacy aliases kept for tests/helpers that still name a colour directly.
+# Rendering never uses these: it always goes through a Palette role.
 SGR_GREEN = "32"
 SGR_YELLOW = "33"
 SGR_RED = "31"
@@ -142,6 +391,17 @@ def truncate_display(text, width):
     return "".join(out)
 
 
+def truncate_ellipsis(text, width, mark="…"):
+    """Truncate the head of ``text`` and mark the cut with ``mark`` (one cell)."""
+    if width <= 0 or not text:
+        return ""
+    if display_width(text) <= width:
+        return text
+    if width <= display_width(mark):
+        return truncate_display(mark, width)
+    return truncate_display(text, width - display_width(mark)) + mark
+
+
 def truncate_left_display(text, width):
     """Keep the *tail* of ``text`` in ``width`` columns (paths/filenames)."""
     if width <= 0 or not text:
@@ -197,21 +457,41 @@ def _safe_text(text):
     return "".join(out)
 
 
+def _attr_code(value):
+    """One attribute as an SGR prefix (palette strings or numeric codes)."""
+    text = str(value)
+    if not text:
+        return ""
+    if text.startswith("\x1b["):
+        return text
+    return sgr(text)
+
+
+def _attr_list(value):
+    """Normalise one style or a sequence of styles into a tuple."""
+    if not value:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
+
+
 def _apply_attrs(text, attrs, base_attrs=()):
     """Wrap text in SGR attributes; combine base (selection) with local style."""
-    codes = [str(c) for c in base_attrs if str(c)]
-    codes += [str(c) for c in attrs if str(c)]
-    if not codes:
+    prefix = "".join(_attr_code(c) for c in _attr_list(base_attrs))
+    prefix += "".join(_attr_code(c) for c in _attr_list(attrs))
+    if not prefix:
         return text
-    return sgr(*codes) + text + RESET
+    return prefix + text + RESET
 
 
 def compose_segments(segments, width, base_attrs=()):
     """Render ``[(attrs, text)]`` to exactly ``width`` columns.
 
     Truncation is by display width across segment boundaries, so no half-cell
-    is ever written.  ``base_attrs`` (selection reverse, for instance) applies
-    to every cell, including padding, and is merged with each segment style.
+    is ever written.  ``base_attrs`` (selection background, for instance)
+    applies to every cell, including padding, and is merged with each segment
+    style.
     """
     if width <= 0:
         return ""
@@ -245,6 +525,27 @@ def compose_plain(segments, width):
     if used < width:
         out.append(" " * (width - used))
     return "".join(out)
+
+
+def compose_right(left_segments, right_segments, width, base_attrs=()):
+    """Left-aligned text plus right-aligned segments, padded to ``width``.
+
+    Used for the dim task count and the unread dot, both of which must hold
+    the right edge without breaking the row's selection background.
+    """
+    if width <= 0:
+        return ""
+    right_width = sum(display_width(_safe_text(text))
+                      for _attrs, text in right_segments)
+    if right_width <= 0:
+        return compose_segments(left_segments, width, base_attrs)
+    if right_width >= width:
+        return compose_segments(right_segments, width, base_attrs)
+    left_width = max(0, width - right_width - 1)
+    left = compose_segments(left_segments, left_width, base_attrs)
+    gap = width - left_width - right_width
+    return (left + _apply_attrs(" " * gap, (), base_attrs) +
+            compose_segments(right_segments, right_width, base_attrs))
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +771,28 @@ def clamp_cursor(cursor, total):
     return max(0, min(int(cursor), total - 1))
 
 
+def selectable_indices(rows):
+    """Row indices the cursor may own (separator rules are not selectable)."""
+    return [i for i, row in enumerate(rows or [])
+            if row.get("kind") != "sep"]
+
+
+def step_selectable(rows, cursor, delta):
+    """Move ``delta`` selectable rows from ``cursor``; clamp at the ends."""
+    indices = selectable_indices(rows)
+    if not indices:
+        return 0
+    position = 0
+    for pos, index in enumerate(indices):
+        if index >= cursor:
+            position = pos
+            break
+    else:
+        position = len(indices) - 1
+    position = max(0, min(position + int(delta), len(indices) - 1))
+    return indices[position]
+
+
 # ---------------------------------------------------------------------------
 # State reading (read-only)
 # ---------------------------------------------------------------------------
@@ -511,24 +834,49 @@ def _live_tab_info(live, tab_id):
     return tabs.get(tab_id) or {}
 
 
-def build_rows(state, live=None):
+def _pane_name(pane, index):
+    name = pane.get("name")
+    if name:
+        return str(name)
+    command = pane.get("live_command")
+    if command:
+        return str(command)
+    return "pane %d" % (index + 1)
+
+
+def _tab_panes(tab):
+    panes = []
+    for index, pane in enumerate(tab.get("panes") or []):
+        if not isinstance(pane, dict):
+            continue
+        entry = dict(pane)
+        if not isinstance(entry.get("index"), int):
+            entry["index"] = index
+        panes.append(entry)
+    return panes
+
+
+def build_rows(state, live=None, tab_expanded=None):
     """Build the flat tree row model from a state document.
 
     Row dicts carry everything the renderer and the action handlers need::
 
-        kind        project | task | tab
+        kind        project | task | tab | pane | sep
         key         stable identity across refreshes
         pid, tid    owning project/task ids (tid only for task rows/tabs)
         context     "proj" or "task:<tid>"
-        tab_id      terminal id (tab rows only)
+        tab_id      terminal id (tab and pane rows)
+        pane_index  0-based content index (pane rows, single-tab rows)
         window      live window index (tab rows only)
-        depth       0/1/2
+        depth       0=project, 1=task, 2=tab/single-tab, 3=pane
         name        display text
         path        project/task worktree path for the editor
-        expanded    project/task expansion flag
+        expanded    project/task/tab expansion flag
         has_children
+        single      a tab with exactly one content pane collapses to one row
+        pane_count  content pane count
         unread      window_activity_flag, propagated to parents
-        active_context / active_window
+        active_context / active_window / pane_active
     """
     state = state or {}
     active = state.get("active") or {}
@@ -540,6 +888,7 @@ def build_rows(state, live=None):
         # While this window is inactive we skip the tmux window list; the
         # stored active window is still a useful highlight anchor.
         active_window = active.get("window")
+    tab_expanded = tab_expanded or {}
 
     def tab_unread(tab, info):
         # Never show a marker for the window the client is currently viewing.
@@ -547,7 +896,7 @@ def build_rows(state, live=None):
             return False
         return bool(info.get("flag"))
 
-    def make_tab_row(tab, pid, tid, context, depth, path):
+    def make_tab_rows(tab, pid, tid, context, depth, path, unread):
         tab_id = tab.get("id")
         info = _live_tab_info(live, tab_id)
         window = tab.get("window")
@@ -558,30 +907,91 @@ def build_rows(state, live=None):
              window == active_window)
             or bool(info.get("active"))
         )
-        return {
+        panes = _tab_panes(tab)
+        pane_count = tab.get("pane_count")
+        if not isinstance(pane_count, int) or pane_count < 1:
+            pane_count = max(1, len(panes))
+        single = (len(panes) <= 1 and pane_count <= 1)
+        key = "tab:%s:%s" % (pid, tab_id)
+        if single:
+            expanded = False
+        else:
+            expanded = bool(tab_expanded.get(key, True))
+        tab_name = tab.get("name") or "tab"
+        live_command = ""
+        pane_index = 0
+        if panes:
+            try:
+                pane_index = int(tab.get("active_pane") or 0)
+            except (TypeError, ValueError):
+                pane_index = 0
+            if pane_index < 0 or pane_index >= len(panes):
+                pane_index = 0
+            live_command = str(panes[pane_index].get("live_command") or "")
+        rows = [{
             "kind": "tab",
-            "key": "tab:%s:%s" % (pid, tab_id),
+            "key": key,
             "pid": pid,
             "tid": tid,
             "context": context,
             "tab_id": tab_id,
             "window": window if isinstance(window, int) else None,
             "depth": depth,
-            "name": tab.get("name") or "tab",
+            "name": tab_name,
             "path": path,
-            "expanded": False,
-            "has_children": False,
-            "unread": tab_unread(tab, info),
+            "expanded": expanded,
+            "has_children": not single,
+            "single": single,
+            "pane_count": pane_count,
+            "pane_index": pane_index if single else None,
+            "live_command": live_command,
+            "unread": unread,
             "active_context": False,
             "active_window": is_active_window,
+            "pane_active": False,
             "tab_kind": tab.get("kind") or "shell",
-        }
+            "branch": None,
+            "task_count": 0,
+        }]
+        if single or not expanded:
+            return rows
+        try:
+            active_pane = int(tab.get("active_pane") or 0)
+        except (TypeError, ValueError):
+            active_pane = 0
+        for index, pane in enumerate(panes):
+            pane_active = bool(pane.get("active")) or index == active_pane
+            rows.append({
+                "kind": "pane",
+                "key": "pane:%s:%s:%d" % (pid, tab_id, index),
+                "pid": pid,
+                "tid": tid,
+                "context": context,
+                "tab_id": tab_id,
+                "window": window if isinstance(window, int) else None,
+                "depth": depth + 1,
+                "name": _pane_name(pane, index),
+                "path": path,
+                "expanded": False,
+                "has_children": False,
+                "single": False,
+                "pane_count": pane_count,
+                "pane_index": index,
+                "live_command": str(pane.get("live_command") or ""),
+                "unread": False,
+                "active_context": False,
+                "active_window": is_active_window,
+                "pane_active": pane_active,
+                "tab_kind": None,
+                "branch": None,
+                "task_count": 0,
+            })
+        return rows
 
     rows = []
-    for project in state.get("projects") or []:
+    projects = [p for p in (state.get("projects") or []) if p.get("id")]
+    for project_pos, project in enumerate(projects):
         pid = project.get("id")
-        if not pid:
-            continue
         project_expanded = bool(project.get("expanded"))
         project_tabs = project.get("tabs") or []
         tasks = project.get("tasks") or []
@@ -591,9 +1001,11 @@ def build_rows(state, live=None):
         if project_expanded:
             for tab in sorted_tabs(project_tabs):
                 info = _live_tab_info(live, tab.get("id"))
-                project_unread = project_unread or tab_unread(tab, info)
-                child_rows.append(
-                    make_tab_row(tab, pid, None, "proj", 1, project.get("path"))
+                tab_unread_flag = tab_unread(tab, info)
+                project_unread = project_unread or tab_unread_flag
+                child_rows.extend(
+                    make_tab_rows(tab, pid, None, "proj", 2,
+                                  project.get("path"), tab_unread_flag)
                 )
 
             for task in tasks:
@@ -606,9 +1018,11 @@ def build_rows(state, live=None):
                 task_rows = []
                 for tab in task_tabs:
                     info = _live_tab_info(live, tab.get("id"))
-                    task_unread = task_unread or tab_unread(tab, info)
-                    task_rows.append(
-                        make_tab_row(tab, pid, tid, context, 2, task.get("path"))
+                    tab_unread_flag = tab_unread(tab, info)
+                    task_unread = task_unread or tab_unread_flag
+                    task_rows.extend(
+                        make_tab_rows(tab, pid, tid, context, 2,
+                                      task.get("path"), tab_unread_flag)
                     )
                 project_unread = project_unread or task_unread
                 child_rows.append({
@@ -624,12 +1038,19 @@ def build_rows(state, live=None):
                     "path": task.get("path"),
                     "expanded": bool(task.get("expanded")),
                     "has_children": bool(task_tabs),
+                    "single": False,
+                    "pane_count": 0,
+                    "pane_index": None,
+                    "live_command": "",
                     "unread": task_unread,
                     "active_context": (
                         pid == active_pid and active_ctx == context
                     ),
                     "active_window": False,
+                    "pane_active": False,
                     "tab_kind": None,
+                    "branch": task.get("branch"),
+                    "task_count": 0,
                 })
                 if task.get("expanded"):
                     child_rows.extend(task_rows)
@@ -657,14 +1078,48 @@ def build_rows(state, live=None):
             "path": project.get("path"),
             "expanded": project_expanded,
             "has_children": bool(project_tabs or tasks),
+            "single": False,
+            "pane_count": 0,
+            "pane_index": None,
+            "live_command": "",
             "unread": project_unread,
             "active_context": (
                 pid == active_pid and active_ctx == "proj"
             ),
             "active_window": False,
+            "pane_active": False,
             "tab_kind": None,
+            "branch": None,
+            "task_count": len(tasks),
         })
         rows.extend(child_rows)
+        # A calm dim rule separates project groups (not a selectable row).
+        if project_pos < len(projects) - 1:
+            rows.append({
+                "kind": "sep",
+                "key": "sep:%s" % pid,
+                "pid": pid,
+                "tid": None,
+                "context": "proj",
+                "tab_id": None,
+                "window": None,
+                "depth": 0,
+                "name": "",
+                "path": None,
+                "expanded": False,
+                "has_children": False,
+                "single": False,
+                "pane_count": 0,
+                "pane_index": None,
+                "live_command": "",
+                "unread": False,
+                "active_context": False,
+                "active_window": False,
+                "pane_active": False,
+                "tab_kind": None,
+                "branch": None,
+                "task_count": 0,
+            })
 
     return rows
 
@@ -682,6 +1137,8 @@ def parent_key(row):
         return None
     if row.get("kind") == "task":
         return "project:%s" % row.get("pid")
+    if row.get("kind") == "pane":
+        return "tab:%s:%s" % (row.get("pid"), row.get("tab_id"))
     if row.get("kind") == "tab":
         if row.get("tid"):
             return "task:%s:%s" % (row.get("pid"), row.get("tid"))
@@ -689,10 +1146,169 @@ def parent_key(row):
     return None
 
 
+def first_child_index(rows, index):
+    """Visible row directly below a parent row, or None."""
+    if index is None or rows is None:
+        return None
+    parent = rows[index]
+    if index + 1 >= len(rows):
+        return None
+    child = rows[index + 1]
+    if child.get("depth") == int(parent.get("depth") or 0) + 1:
+        return index + 1
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Contextual footer and help overlay (pure)
+# ---------------------------------------------------------------------------
+FOOTER_MOUSE = "click select · again open · r-click menu"
+FOOTER_MOUSE_COMPACT = "click · again · r-click menu"
+FOOTER_MOUSE_TINY = "click · menu"
+FOOTER_HELP = "? close · j/k scroll"
+TREE_FOOTER_TALL = 12
+
+
+def tree_footer_count(height):
+    """One footer line on short terminals, two when there is room."""
+    return 2 if int(height) >= TREE_FOOTER_TALL else 1
+
+
+def footer_actions(row, width=None):
+    """Three or four honest actions for the selected row's kind.
+
+    With a width, drop trailing actions only when the joined line would not
+    fit: the default 30-column tree shows three actions, and 24 columns still
+    shows the two most important ones.
+    """
+    if not row or row.get("kind") == "sep":
+        actions = ["? help", "p project"]
+    else:
+        kind = row.get("kind")
+        if kind == "project":
+            actions = ["? help", "enter open", "n task", "t term"]
+        elif kind == "task":
+            actions = ["? help", "enter open", "t term", "d close"]
+        elif kind == "pane":
+            actions = ["? help", "enter focus", "t term"]
+            actions.append("d close" if row.get("tid") else "e edit")
+        elif row.get("has_children"):
+            actions = ["? help", "enter open", "l panes", "t term"]
+        else:
+            actions = ["? help", "enter open", "t term", "e edit"]
+    if width is None:
+        return actions
+    for count in range(len(actions), 0, -1):
+        if display_width(" · ".join(actions[:count])) <= width:
+            return actions[:count]
+    return actions[:1]
+
+
+def mouse_footer(width=None):
+    """The mouse hint, compacted only when the full line would be cut."""
+    if width is None or display_width(FOOTER_MOUSE) <= width:
+        return FOOTER_MOUSE
+    if display_width(FOOTER_MOUSE_COMPACT) <= width:
+        return FOOTER_MOUSE_COMPACT
+    return FOOTER_MOUSE_TINY
+
+
+def tree_footer_lines(row, height, width=None):
+    """Footer strings for the tree (help mode uses ``FOOTER_HELP``)."""
+    lines = [" · ".join(footer_actions(row, width))]
+    if tree_footer_count(height) >= 2:
+        lines.append(mouse_footer(width))
+    return lines
+
+
+# Key column is kept narrow so the overlay stays readable at the default
+# ~30-column tree width (and still trims gracefully at 24).
+HELP_SECTIONS = [
+    ("NAVIGATION", [
+        "j/k ↑↓     move",
+        "g/G        top/bottom",
+        "h/l ←→     fold/unfold",
+        "Enter      open/focus",
+        "?          close help",
+    ]),
+    ("SESSIONS", [
+        "n          new task",
+        "t          new terminal",
+        "d          close task",
+        "e          editor",
+        "p          add project",
+    ]),
+    ("MOUSE", [
+        "click      select",
+        "click again open",
+        "chevron    fold/unfold",
+        "wheel      scroll",
+        "right-click menu",
+        "text select needs C-a [",
+    ]),
+    ("TMUX", [
+        "C-a N/T/P  task/term",
+        'C-a " / %  split h/v',
+        "C-a z      zoom pane",
+        "C-a d      detach",
+    ]),
+    ("DIFF / COPY", [
+        "Enter file diff popup",
+        "C-a [      copy-mode",
+    ]),
+]
+
+
+def help_content():
+    """``[(role, text)]``: section headings are ``section`` rows."""
+    lines = []
+    for section, entries in HELP_SECTIONS:
+        if lines:
+            lines.append(("blank", ""))
+        lines.append(("section", section))
+        for entry in entries:
+            lines.append(("text", entry))
+    return lines
+
+
+def help_max_scroll(width, height):
+    """Scrollable content rows inside the overlay (0 when it all fits)."""
+    if width < 20 or height < 8:
+        return 0
+    inner_height = max(1, (height - 1) - 2)
+    return max(0, len(help_content()) - inner_height)
+
+
+def help_key_action(name, scroll, max_scroll):
+    """Return ``(action, new_scroll)`` for a key while help is open."""
+    scroll = max(0, min(int(scroll), int(max_scroll)))
+    if name in ("?", "Esc", "q"):
+        return "close", scroll
+    if name in ("j", "Down"):
+        return "scroll", min(max_scroll, scroll + 1)
+    if name in ("k", "Up"):
+        return "scroll", max(0, scroll - 1)
+    if name == "PgDn":
+        return "scroll", min(max_scroll, scroll + 5)
+    if name == "PgUp":
+        return "scroll", max(0, scroll - 5)
+    if name in ("g", "Home"):
+        return "scroll", 0
+    if name in ("G", "End"):
+        return "scroll", max_scroll
+    return "none", scroll
+
+
 # ---------------------------------------------------------------------------
 # Git status presentation (pure functions)
 # ---------------------------------------------------------------------------
 CONFLICT_CODES = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
+GIT_SECTIONS = (
+    (0, "Conflicts"),
+    (1, "Staged"),
+    (2, "Unstaged"),
+    (3, "Untracked"),
+)
 
 
 def _status_xy(item):
@@ -727,23 +1343,73 @@ def sort_git_files(files):
     return [item for _index, item in pairs]
 
 
-def format_ahead_behind(ahead, behind):
+def group_git_files(files):
+    """``[(label, [items])]`` in section order, omitting empty sections."""
+    buckets = {category: [] for category, _label in GIT_SECTIONS}
+    for item in files or []:
+        buckets[git_file_category(item)].append(item)
+    groups = []
+    for category, label in GIT_SECTIONS:
+        if buckets[category]:
+            groups.append((label, buckets[category]))
+    return groups
+
+
+def git_frame_rows(files):
+    """Render rows for the git list: section headers plus file rows.
+
+    File entries carry their index in ``sort_git_files(files)`` so cursor and
+    hit testing stay in sync with the flat list.
+    """
+    ordered = sort_git_files(files)
+    frames = []
+    position = 0
+    for label, items in group_git_files(ordered):
+        frames.append({"kind": "section", "label": label, "count": len(items)})
+        for item in items:
+            frames.append({"kind": "file", "item": item, "index": position})
+            position += 1
+    return frames
+
+
+def git_frame_index(files, file_index):
+    """Frame row index of the selected file (section rows shift it down)."""
+    frames = git_frame_rows(files)
+    file_index = max(0, int(file_index))
+    seen = 0
+    for index, frame in enumerate(frames):
+        if frame.get("kind") != "file":
+            continue
+        if seen == file_index:
+            return index
+        seen += 1
+    return max(0, len(frames) - 1)
+
+
+def format_ahead_behind(ahead, behind, glyphs=None):
     """``↑3 ↓1`` style summary; blank when both are null/zero."""
+    glyphs = glyphs or default_glyphs()
     parts = []
     if isinstance(ahead, int) and ahead > 0:
-        parts.append("↑%d" % ahead)
+        parts.append("%s%d" % (glyphs.ahead, ahead))
     if isinstance(behind, int) and behind > 0:
-        parts.append("↓%d" % behind)
+        parts.append("%s%d" % (glyphs.behind, behind))
     return " ".join(parts)
 
 
-def git_header_text(status):
+def git_header_text(status, glyphs=None):
     """Return ``(branch_or_detached, ahead_behind)`` for the header line."""
     status = status or {}
     branch = status.get("branch")
-    if not branch:
-        branch = "detached HEAD" if status.get("detached") else "unknown"
-    return branch, format_ahead_behind(status.get("ahead"), status.get("behind"))
+    counters = format_ahead_behind(status.get("ahead"), status.get("behind"),
+                                   glyphs)
+    if branch:
+        return branch, counters
+    if status.get("detached"):
+        head = status.get("head") or ""
+        short = head[:7] if isinstance(head, str) and head else ""
+        return ("detached @ %s" % short if short else "detached"), counters
+    return "unknown", counters
 
 
 def format_git_row_text(item):
@@ -758,40 +1424,48 @@ def format_git_row_text(item):
     return "%s%s %s" % (x, y, target)
 
 
-def git_row_segments(item):
-    """Styled segments for a file line: staged green, unstaged red/yellow."""
+def _git_role_for_char(char):
+    if char in ("A",):
+        return "add"
+    if char in ("M", "R", "C", "T"):
+        return "modify"
+    if char in ("D", "U"):
+        return "delete"
+    return "dimmer"
+
+
+def git_row_segments(item, palette=None):
+    """Styled segments for a file line.
+
+    The XY badge is coloured by state (green added, amber modified, red
+    deleted/conflict); the path itself is normal text.  Untracked files show a
+    single ``?`` badge.
+    """
+    palette = palette or default_palette()
     x, y = _status_xy(item)
     status = x + y
     path = item.get("path") or ""
     orig = item.get("orig_path")
     display_path = "%s -> %s" % (orig, path) if orig else path
-    cat = git_file_category(item)
-
-    if cat == 0 or status in CONFLICT_CODES or x == "U" or y == "U":
-        xstyle = [SGR_BOLD, SGR_MAGENTA]
-        ystyle = [SGR_BOLD, SGR_MAGENTA]
-        pstyle = [SGR_MAGENTA]
-    elif item.get("untracked") or status == "??":
-        xstyle = [SGR_CYAN]
-        ystyle = [SGR_CYAN]
-        pstyle = [SGR_CYAN]
-    elif item.get("staged") and item.get("unstaged"):
-        xstyle = [SGR_GREEN]
-        ystyle = [SGR_RED]
-        pstyle = []
-    elif item.get("staged"):
-        xstyle = [SGR_GREEN]
-        ystyle = [SGR_GREEN]
-        pstyle = [SGR_GREEN]
+    conflict = (status in CONFLICT_CODES or x == "U" or y == "U")
+    if item.get("untracked") or status == "??":
+        return [
+            (palette.sgr(fg="modify", bold=True), "?"),
+            (palette.sgr(fg="text"), " "),
+            (palette.sgr(fg="text"), " "),
+            (palette.sgr(fg="text"), display_path),
+        ]
+    if conflict:
+        xstyle = palette.sgr(fg="delete", bold=True)
+        ystyle = xstyle
     else:
-        xstyle = [SGR_RED]
-        ystyle = [SGR_RED]
-        pstyle = [SGR_RED]
+        xstyle = palette.sgr(fg=_git_role_for_char(x))
+        ystyle = palette.sgr(fg=_git_role_for_char(y))
     return [
         (xstyle, x),
         (ystyle, y),
-        ([], " "),
-        (pstyle, display_path),
+        (palette.sgr(fg="text"), " "),
+        (palette.sgr(fg="text"), display_path),
     ]
 
 
@@ -850,12 +1524,13 @@ def git_diff_command(path, item, pager="less -R"):
 def menu_items_for_row(row, state):
     """Return ``[(label, key, argv)]`` for the right-click menu.
 
-    ``argv`` is a balamba command (the caller will wrap it in
-    ``run-shell -b``); editor items are added by the app because they are a
-    tmux popup rather than a CLI mutation.
+    ``argv`` is a balamba command (the caller wraps it in ``run-shell -b``);
+    editor items have ``None`` because they are a tmux popup, and the Help
+    item has ``["@help"]`` because it sends ``?`` back into this pane.
     """
+    help_item = ("Help", "?", ["@help"])
     if not row:
-        return [("Add project", "p", ["internal", "add-project"])]
+        return [("Add project", "p", ["internal", "add-project"]), help_item]
     pid = row.get("pid")
     kind = row.get("kind")
     items = []
@@ -864,9 +1539,7 @@ def menu_items_for_row(row, state):
         items.append(("New terminal", "t", ["internal", "new-terminal"]))
         items.append(("Add project", "p", ["internal", "add-project"]))
         toggle = "collapse" if row.get("expanded") else "expand"
-        items.append(
-            (toggle.capitalize(), "e", ["internal", toggle, pid])
-        )
+        items.append((toggle.capitalize(), "e", ["internal", toggle, pid]))
     elif kind == "task":
         items.append(("New terminal", "t", ["internal", "new-terminal"]))
         items.append(("New task", "n", ["internal", "new-task"]))
@@ -879,6 +1552,14 @@ def menu_items_for_row(row, state):
              ["internal", toggle, pid, row.get("tid")])
         )
         items.append(("Open in editor", "o", None))
+    elif kind == "pane":
+        items.append(("New terminal", "t", ["internal", "new-terminal"]))
+        if row.get("tid"):
+            items.append(
+                ("Close task", "d",
+                 ["internal", "close-task", pid, row.get("tid")])
+            )
+        items.append(("Open in editor", "o", None))
     else:
         items.append(("New terminal", "t", ["internal", "new-terminal"]))
         if row.get("tid"):
@@ -887,6 +1568,7 @@ def menu_items_for_row(row, state):
                  ["internal", "close-task", pid, row.get("tid")])
             )
         items.append(("Open in editor", "o", None))
+    items.append(help_item)
     return items
 
 
@@ -1075,75 +1757,266 @@ TREE_MIN_WIDTH = 10
 TREE_MIN_HEIGHT = 5
 
 
-def tree_row_segments(row, selected, width):
+def row_chevron_col(row):
+    """0-based column of a row's chevron (selection bar reserves column 0)."""
+    return 1 + int(row.get("depth") or 0) * 2
+
+
+def is_chevron_click(row, col):
+    if not row or not row.get("has_children"):
+        return False
+    start = row_chevron_col(row)
+    return start <= int(col) <= start + 1
+
+
+def _row_right_segments(row, palette, glyphs):
+    """Right-aligned dim count and amber unread dot."""
+    right = []
+    if row.get("kind") == "project":
+        count = int(row.get("task_count") or 0)
+        if count:
+            label = "%d task%s" % (count, "" if count == 1 else "s")
+            right.append((palette.sgr(fg="dim"), label))
+    if row.get("unread") and row.get("kind") != "pane":
+        if right:
+            right.append((palette.sgr(fg="dim"), " "))
+        right.append((palette.sgr(fg="unread"), glyphs.unread))
+    return right
+
+
+def tree_row_segments(row, selected, width, palette=None, glyphs=None):
+    """Styled segments for one tree row (without the selection bar)."""
+    palette = palette or default_palette()
+    glyphs = glyphs or default_glyphs()
+    width = max(0, int(width))
+    kind = row.get("kind") or "tab"
+    if kind == "sep":
+        return ([(palette.sgr(fg="dimmer"), glyphs.rule * max(1, width))], [])
     depth = int(row.get("depth") or 0)
     indent = "  " * depth
-    kind = row.get("kind")
+    right = _row_right_segments(row, palette, glyphs)
+    right_width = sum(display_width(text) for _attrs, text in right)
+    budget = max(0, width - right_width - (1 if right_width else 0) - 1)
+
     if kind in ("project", "task"):
+        marker = " "
         if row.get("has_children"):
-            chevron = "▾" if row.get("expanded") else "▸"
-        else:
-            chevron = " "
-        prefix = indent + chevron + " "
+            marker = (glyphs.chevron_open if row.get("expanded")
+                      else glyphs.chevron_closed)
+        prefix_segments = [
+            (palette.sgr(fg="dimmer"), indent),
+            (palette.sgr(fg="dim"), marker + " "),
+        ]
+    elif kind == "pane":
+        prefix_segments = [
+            (palette.sgr(fg="dimmer"), indent),
+            (palette.sgr(fg="dim"), glyphs.pane + " "),
+        ]
     else:
-        icon = "$" if row.get("tab_kind") != "agent" else "A"
-        prefix = indent + icon + " "
+        # tab: single-pane tabs use a kind glyph, split tabs a chevron.
+        if row.get("has_children"):
+            marker = (glyphs.chevron_open if row.get("expanded")
+                      else glyphs.chevron_closed)
+            marker_style = palette.sgr(fg="dim")
+        else:
+            agent = (row.get("tab_kind") == "agent")
+            marker = glyphs.agent if agent else glyphs.shell
+            marker_style = palette.sgr(fg="accent" if agent else "dim")
+        prefix_segments = [
+            (palette.sgr(fg="dimmer"), indent),
+            (marker_style, marker + " "),
+        ]
 
-    name = row.get("name") or ""
-    style = []
-    if row.get("active_context"):
-        style = [SGR_BOLD, SGR_GREEN]
-    elif row.get("active_window"):
-        style = [SGR_BOLD, SGR_CYAN]
+    used = sum(display_width(text) for _attrs, text in prefix_segments)
+    name = _safe_text(row.get("name") or "")
+    name_budget = max(1, budget - used)
+    name_text = truncate_ellipsis(name, name_budget, glyphs.ellipsis)
 
-    unread = bool(row.get("unread"))
-    dot_room = 2 if unread and width >= 3 else 0
-    left_width = max(1, width - dot_room)
-    left = truncate_display(prefix + name, left_width)
-    segments = [(style, left)]
-    if unread and dot_room:
-        used = display_width(left)
-        gap = max(0, width - used - 1)
-        segments.append(([], " " * gap))
-        segments.append(([SGR_YELLOW], "●"))
-    return segments
+    if kind == "project":
+        style = palette.sgr(fg="text", bold=True)
+    elif row.get("active_context") or row.get("active_window"):
+        style = palette.sgr(fg="accent", bold=True)
+    elif kind == "pane" and row.get("pane_active"):
+        style = palette.sgr(fg="accent", bold=True)
+    elif kind == "pane":
+        style = palette.sgr(fg="text")
+    else:
+        style = palette.sgr(fg="text")
+    segments = list(prefix_segments) + [(style, name_text)]
+    used += display_width(name_text)
+
+    detail = ""
+    detail_style = palette.sgr(fg="dim")
+    if kind == "task":
+        branch = row.get("branch")
+        if branch:
+            room = budget - used - 2
+            if room >= display_width(str(branch)):
+                detail = str(branch)
+    elif kind == "pane":
+        command = str(row.get("live_command") or "")
+        if command and command != name:
+            room = budget - used - 2
+            if room > 1:
+                detail = truncate_ellipsis(command, room, glyphs.ellipsis)
+    elif kind == "tab":
+        if row.get("has_children"):
+            count = int(row.get("pane_count") or 0)
+            label = "%d pane%s" % (count, "" if count == 1 else "s")
+            room = budget - used - 2
+            if room >= display_width(label):
+                detail = label
+        else:
+            command = str(row.get("live_command") or "")
+            if command and command != name:
+                room = budget - used - 2
+                if room > 1:
+                    detail = truncate_ellipsis(command, room, glyphs.ellipsis)
+    if detail:
+        segments.append((detail_style, "  " + detail))
+
+    return segments, right
 
 
-def render_tree(rows, cursor, scroll, width, height):
+def tree_row_parts(row, selected, width, palette=None, glyphs=None):
+    """Full row including the accent selection bar / selection background."""
+    palette = palette or default_palette()
+    glyphs = glyphs or default_glyphs()
+    if row.get("kind") == "sep":
+        return ([(palette.sgr(fg="dimmer"), glyphs.rule * max(1, width))], [])
+    segments, right = tree_row_segments(row, selected, width, palette, glyphs)
+    bar = (palette.sgr(fg="accent", bold=True) if selected
+           else palette.sgr(fg="dimmer"))
+    return ([(bar, glyphs.select if selected else " ")] + segments, right)
+
+
+def render_tree(rows, cursor, scroll, width, height, palette=None, glyphs=None):
     """Render the tree; returns ``(lines, new_scroll)``."""
+    palette = palette or default_palette()
+    glyphs = glyphs or default_glyphs()
+    width = max(1, int(width))
+    height = max(1, int(height))
     if width < TREE_MIN_WIDTH or height < TREE_MIN_HEIGHT:
         message = "balamba: pane too small"
-        return [compose_segments([([SGR_DIM], message)], max(width, 1))], 0
+        return [compose_segments([(palette.sgr(fg="dim"), message)], width)], 0
+
+    row_at_cursor = None
+    if rows:
+        cursor = clamp_cursor(cursor, len(rows))
+        while cursor < len(rows) and rows[cursor].get("kind") == "sep":
+            cursor += 1
+        if cursor >= len(rows):
+            usable = selectable_indices(rows)
+            cursor = usable[-1] if usable else 0
+        row_at_cursor = rows[cursor] if rows else None
+
+    footer = tree_footer_lines(row_at_cursor, height, width)
+    body_height = max(1, height - len(footer))
+
+    body_lines = []
+    start = 0
     if not rows:
-        return [compose_segments([([SGR_DIM], "no projects — press p")],
-                                 width)], 0
-
-    cursor = clamp_cursor(cursor, len(rows))
-    indices, start = viewport_slice(len(rows), cursor, scroll, height)
-    lines = []
-    for index in indices:
-        if index is None:
-            lines.append(compose_segments([([SGR_DIM], "…")], width))
-            continue
-        row = rows[index]
-        selected = index == cursor
-        base = [SGR_REVERSE] if selected else []
-        lines.append(
-            compose_segments(tree_row_segments(row, selected, width),
-                             width, base)
-        )
-    return lines, start
-
-
-def render_error(width, height, message):
-    if width < TREE_MIN_WIDTH or height < TREE_MIN_HEIGHT:
-        return [compose_segments([([SGR_DIM], "balamba: too small")],
-                                 max(width, 1))]
-    lines = [
-        compose_segments([([SGR_BOLD, SGR_RED], "state unavailable")], width),
-        compose_segments([([SGR_DIM], message)], width),
+        body_lines.append(
+            compose_segments([(palette.sgr(fg="dim"), "no projects")], width))
+        body_lines.append(
+            compose_segments([(palette.sgr(fg="dim"), "press p to add one")],
+                             width))
+    else:
+        indices, start = viewport_slice(len(rows), cursor, scroll, body_height)
+        for index in indices:
+            if index is None:
+                body_lines.append(
+                    compose_segments([(palette.sgr(fg="dim"), glyphs.ellipsis)],
+                                     width))
+                continue
+            row = rows[index]
+            selected = index == cursor and row.get("kind") != "sep"
+            segments, right = tree_row_parts(
+                row, selected, width, palette, glyphs)
+            base = [palette.bg("selbg")] if selected else []
+            body_lines.append(
+                compose_right(segments, right, width, base))
+    if len(body_lines) < body_height:
+        body_lines.extend([""] * (body_height - len(body_lines)))
+    footer_lines = [
+        compose_segments([(palette.sgr(fg="dim"), line)], width)
+        for line in footer[:max(0, height - body_height)]
     ]
-    return lines
+    return body_lines[:body_height] + footer_lines, start
+
+
+def render_error(width, height, message, palette=None, glyphs=None):
+    palette = palette or default_palette()
+    glyphs = glyphs or default_glyphs()
+    width = max(1, int(width))
+    height = max(1, int(height))
+    if width < TREE_MIN_WIDTH or height < TREE_MIN_HEIGHT:
+        return [compose_segments([(palette.sgr(fg="dim"), "balamba: too small")],
+                                 width)]
+    lines = [
+        compose_segments(
+            [(palette.sgr(fg="delete", bold=True), "state unavailable")], width),
+        compose_segments([(palette.sgr(fg="dim"), message)], width),
+    ]
+    footer = tree_footer_lines(None, height, width)
+    body_height = max(1, height - len(footer))
+    if len(lines) < body_height:
+        lines.extend([""] * (body_height - len(lines)))
+    lines = lines[:body_height]
+    lines.extend(
+        compose_segments([(palette.sgr(fg="dim"), line)], width)
+        for line in footer)
+    return lines[:height]
+
+
+# ---------------------------------------------------------------------------
+# Rendering: help overlay (in-pane, never a tmux popup)
+# ---------------------------------------------------------------------------
+def render_help(width, height, palette=None, glyphs=None, scroll=0,
+                help_open=True):
+    """Bordered in-pane help with a pinned ``? close · j/k scroll`` footer."""
+    palette = palette or default_palette()
+    glyphs = glyphs or default_glyphs()
+    width = max(1, int(width))
+    height = max(1, int(height))
+    if width < 20 or height < 8:
+        lines = [
+            compose_segments([(palette.sgr(fg="dim"),
+                               truncate_ellipsis(
+                                   "help — ? closes", width, glyphs.ellipsis))],
+                             width)
+        ]
+        return lines[:height]
+
+    footer = [FOOTER_HELP]
+    box_height = max(3, height - len(footer))
+    inner_width = max(1, width - 4)
+    inner_height = max(1, box_height - 2)
+    content = help_content()
+    max_scroll = max(0, len(content) - inner_height)
+    scroll = max(0, min(int(scroll), max_scroll))
+
+    top = (glyphs.tl + glyphs.h + " help " +
+           glyphs.h * max(0, width - 9) + glyphs.tr)
+    top = pad_display(top, width, "left")
+    bottom = (glyphs.bl + glyphs.h * max(0, width - 2) + glyphs.br)
+    bottom = pad_display(bottom, width, "left")
+
+    lines = [compose_segments([(palette.sgr(fg="accent"), top)], width)]
+    visible = content[scroll:scroll + inner_height]
+    for _kind, text in visible:
+        row = glyphs.v + " " + pad_display(text, inner_width) + " " + glyphs.v
+        style = (palette.sgr(fg="accent", bold=True)
+                 if _kind == "section" else palette.sgr(fg="text"))
+        lines.append(compose_segments([(style, row)], width))
+    for _ in range(inner_height - len(visible)):
+        row = glyphs.v + " " * (inner_width + 2) + glyphs.v
+        lines.append(compose_segments([(palette.sgr(fg="dim"), row)], width))
+    lines.append(compose_segments([(palette.sgr(fg="accent"), bottom)], width))
+    lines.extend(
+        compose_segments([(palette.sgr(fg="dim"), line)], width)
+        for line in footer)
+    return lines[:height]
 
 
 # ---------------------------------------------------------------------------
@@ -1153,61 +2026,100 @@ GIT_MIN_WIDTH = 10
 GIT_MIN_HEIGHT = 5
 
 
-def render_git(status, error, cursor, scroll, width, height):
+def render_git(status, error, cursor, scroll, width, height, palette=None,
+               glyphs=None):
     """Render the git pane.  Returns ``(lines, start)``."""
+    palette = palette or default_palette()
+    glyphs = glyphs or default_glyphs()
+    width = max(1, int(width))
+    height = max(1, int(height))
     if width < GIT_MIN_WIDTH or height < GIT_MIN_HEIGHT:
-        return [compose_segments([([SGR_DIM], "balamba: pane too small")],
-                                 max(width, 1))], 0
+        return [compose_segments([(palette.sgr(fg="dim"), "balamba: pane too small")],
+                                 width)], 0
 
+    footer = "enter diff · r refresh"
+    body_height = max(1, height - 2)  # header + footer
     lines = []
     if error:
         branch = "unknown"
         ahead_behind = ""
+        detached = False
     elif not status:
         branch = "no status"
         ahead_behind = ""
+        detached = False
     else:
-        branch, ahead_behind = git_header_text(status)
+        branch, ahead_behind = git_header_text(status, glyphs)
+        detached = bool(status.get("detached")) and not status.get("branch")
 
-    header_segments = [([SGR_BOLD], branch)]
+    branch_style = (palette.sgr(fg="unread", bold=True) if detached
+                    else palette.sgr(fg="text", bold=True))
+    header_segments = [(branch_style, branch)]
     if ahead_behind:
-        header_segments.append(([], "  "))
-        header_segments.append(([SGR_GREEN], ahead_behind))
+        header_segments.append((palette.sgr(fg="dim"), "  "))
+        header_segments.append((palette.sgr(fg="dim"), ahead_behind))
     lines.append(compose_segments(header_segments, width))
 
+    body_lines = []
+    start = 0
     if error:
-        lines.append(compose_segments([([SGR_RED], "error")], width))
-        lines.append(compose_segments([([SGR_DIM], error)], width))
-        return lines, 0
-
-    if not status:
-        lines.append(compose_segments([([SGR_DIM], "waiting for status")], width))
-        return lines, 0
-
-    files = sort_git_files(status.get("files") or [])
-    if not files:
-        lines.append(compose_segments([([SGR_GREEN], "clean")], width))
-        return lines, 0
-
-    lines.append(compose_segments([([SGR_DIM], "─" * width)], width))
-    list_height = max(0, height - 2)
-    cursor = clamp_cursor(cursor, len(files))
-    indices, start = viewport_slice(len(files), cursor, scroll, list_height)
-    for index in indices:
-        if index is None:
-            lines.append(compose_segments([([SGR_DIM], "…")], width))
-            continue
-        selected = index == cursor
-        base = [SGR_REVERSE] if selected else []
-        segments = git_row_segments(files[index])
-        # Long paths keep their tail (the filename) rather than the tree prefix.
-        if len(segments) >= 4 and display_width(segments[3][1]) > width:
-            used = display_width(segments[0][1]) + display_width(segments[1][1]) + 1
-            segments[3] = (segments[3][0],
-                           truncate_left_display(segments[3][1],
-                                                 max(1, width - used)))
-        lines.append(compose_segments(segments, width, base))
-    return lines, start
+        body_lines.append(
+            compose_segments([(palette.sgr(fg="delete", bold=True), "error")],
+                             width))
+        body_lines.append(
+            compose_segments([(palette.sgr(fg="dim"), error)], width))
+    elif not status:
+        body_lines.append(
+            compose_segments([(palette.sgr(fg="dim"), "waiting for status")],
+                             width))
+    else:
+        files = sort_git_files(status.get("files") or [])
+        if not files:
+            body_lines.append(
+                compose_segments(
+                    [(palette.sgr(fg="dim"), "working tree clean")], width))
+        else:
+            frames = git_frame_rows(files)
+            cursor = clamp_cursor(cursor, len(files))
+            cursor_frame = git_frame_index(files, cursor)
+            indices, start = viewport_slice(
+                len(frames), cursor_frame, scroll, body_height)
+            for index in indices:
+                if index is None:
+                    body_lines.append(
+                        compose_segments([(palette.sgr(fg="dim"),
+                                           glyphs.ellipsis)], width))
+                    continue
+                frame = frames[index]
+                if frame.get("kind") == "section":
+                    text = "%s %d" % (frame.get("label"),
+                                      frame.get("count") or 0)
+                    body_lines.append(
+                        compose_segments([(palette.sgr(fg="dim"), text)],
+                                         width))
+                    continue
+                item = frame.get("item") or {}
+                selected = frame.get("index") == cursor
+                bar = (palette.sgr(fg="accent", bold=True) if selected
+                       else palette.sgr(fg="dimmer"))
+                segments = [(bar, glyphs.select if selected else " ")]
+                segments.extend(git_row_segments(item, palette))
+                # Long paths keep their tail (the filename) rather than the
+                # tree prefix: left-truncate the path segment with an ellipsis.
+                used = sum(display_width(text)
+                           for _attrs, text in segments[:-1])
+                path_attrs, path_text = segments[-1]
+                room = max(1, width - used)
+                if display_width(path_text) > room:
+                    segments[-1] = (path_attrs,
+                                    truncate_left_display(path_text, room))
+                base = [palette.bg("selbg")] if selected else []
+                body_lines.append(compose_segments(segments, width, base))
+    if len(body_lines) < body_height:
+        body_lines.extend([""] * (body_height - len(body_lines)))
+    lines.extend(body_lines[:body_height])
+    lines.append(compose_segments([(palette.sgr(fg="dim"), footer)], width))
+    return lines[:height], start
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +2141,11 @@ class UIApp:
         self.parser_buf = b""
         self.esc_deadline = None
         self.children = []
+        self.sync_proc = None
+
+        # theme + glyphs
+        self.palette = make_palette("auto", "blue", os.environ)
+        self.glyphs = make_glyphs(ascii_only=detect_ascii(os.environ))
 
         # tree
         self.rows = []
@@ -1237,6 +2154,11 @@ class UIApp:
         self.cursor = 0
         self.tree_scroll = 0
         self.press = None  # (y, x, row_index)
+        self.tab_expanded = {}
+
+        # help overlay
+        self.help_open = False
+        self.help_scroll = 0
 
         # git
         self.git_status = None
@@ -1264,6 +2186,23 @@ class UIApp:
 
     # -- terminal -----------------------------------------------------------
     def _terminal_size(self):
+        # Inside a pane trust tmux's own geometry: detached windows can be
+        # resized with resize-window before the pty's winsize catches up, and
+        # rendering to a stale width clips the right edge.
+        if os.environ.get("TMUX") and self.pane_id:
+            out = tmux_run(
+                ["display", "-p", "-t", self.pane_id,
+                 "#{pane_width}\t#{pane_height}"], timeout=2)
+            if out:
+                pieces = out.strip().split("\t")
+                if len(pieces) >= 2:
+                    try:
+                        width = int(pieces[0])
+                        height = int(pieces[1])
+                    except ValueError:
+                        width = height = 0
+                    if width > 0 and height > 0:
+                        return width, height
         for stream in (self.stdout, sys.stdin):
             try:
                 size = os.get_terminal_size(stream.fileno())
@@ -1318,28 +2257,45 @@ class UIApp:
                 raise OSError(errno.EIO, "short write")
             view = view[written:]
 
+    def _tree_body_height(self):
+        return max(1, self.height - tree_footer_count(self.height))
+
     def paint(self):
-        if self.mode == "tree":
+        if self.help_open:
+            self.help_scroll = max(
+                0, min(self.help_scroll,
+                       help_max_scroll(self.width, self.height)))
+            lines = render_help(self.width, self.height, self.palette,
+                                self.glyphs, self.help_scroll)
+        elif self.mode == "tree":
             if self.tree_error:
-                lines = render_error(self.width, self.height, self.tree_error)
-                start = 0
+                lines = render_error(self.width, self.height, self.tree_error,
+                                     self.palette, self.glyphs)
             else:
-                lines, start = render_tree(self.rows, self.cursor,
-                                           self.tree_scroll, self.width,
-                                           self.height)
+                lines, start = render_tree(
+                    self.rows, self.cursor, self.tree_scroll, self.width,
+                    self.height, self.palette, self.glyphs)
                 if start != self.tree_scroll:
                     self.tree_scroll = start
         else:
-            result = render_git(self.git_status, self.git_error, self.git_cursor,
-                                self.git_scroll, self.width, self.height)
-            lines, start = result
+            lines, start = render_git(
+                self.git_status, self.git_error, self.git_cursor,
+                self.git_scroll, self.width, self.height,
+                self.palette, self.glyphs)
             if start != self.git_scroll:
                 self.git_scroll = start
 
         frame_parts = []
         for row, line in enumerate(lines[: self.height]):
             frame_parts.append("\x1b[%d;1H" % (row + 1))
-            frame_parts.append(line)
+            if line:
+                # Composed lines are padded to exactly the pane width, which
+                # overwrites stale cells.  Do not append CLEAR_LINE here: with
+                # autowrap off the cursor rests *on* the last cell and EL
+                # would erase the final character of a full-width line.
+                frame_parts.append(line)
+            else:
+                frame_parts.append(CLEAR_LINE)
         if len(lines) < self.height:
             frame_parts.append("\x1b[%d;1H%s" % (len(lines) + 1, CLEAR_LINE))
             frame_parts.append("\x1b[J")
@@ -1364,6 +2320,8 @@ class UIApp:
             ("editor", "@balamba_editor", os.environ.get("EDITOR") or "vi"),
             ("default_ref", "@balamba_default_ref", "origin/main"),
             ("default_agent", "@balamba_default_agent", "opencode"),
+            ("theme", "@balamba_theme", "auto"),
+            ("accent", "@balamba_accent", "blue"),
         ]
         for key, option, default in mapping:
             value = tmux_option(option, default)
@@ -1375,6 +2333,10 @@ class UIApp:
                 self.config[key] = max(1, min(number, 3600))
             else:
                 self.config[key] = value if value else default
+        self.palette = make_palette(self.config.get("theme", "auto"),
+                                    self.config.get("accent", "blue"),
+                                    os.environ)
+        self.glyphs = make_glyphs(ascii_only=detect_ascii(os.environ))
 
     def refresh_interval(self, active):
         if self.mode == "git":
@@ -1384,13 +2346,13 @@ class UIApp:
             "idle_refresh"]
 
     # -- actions ------------------------------------------------------------
-    def spawn(self, argv, track=True):
+    def spawn(self, argv, track=True, quiet=False):
         try:
             proc = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=None,
+                stderr=subprocess.DEVNULL if quiet else None,
                 close_fds=True,
             )
         except OSError:
@@ -1451,6 +2413,12 @@ class UIApp:
         if self.pane_id:
             args += ["-t", self.pane_id]
         for label, key, argv in items:
+            if argv == ["@help"]:
+                # Send '?' back into this pane: the menu lives in tmux, the
+                # overlay lives here.
+                command = "send-keys -t %s -l -- ?" % shell_quote(self.pane_id)
+                args += [tmux_format_escape(label), key, command]
+                continue
             if argv is None:
                 # Editor is a tmux popup, not a CLI mutation.
                 path = row.get("path") if row else None
@@ -1488,13 +2456,26 @@ class UIApp:
         if not self.rows:
             return None
         self.cursor = clamp_cursor(self.cursor, len(self.rows))
-        return self.rows[self.cursor]
+        if self.rows[self.cursor].get("kind") == "sep":
+            usable = selectable_indices(self.rows)
+            if not usable:
+                return None
+            if self.cursor > usable[-1]:
+                self.cursor = usable[-1]
+            else:
+                self.cursor = step_selectable(self.rows, self.cursor, 1)
+        return self.rows[self.cursor] if self.rows else None
 
     def activate_row(self, row):
         if not row:
             return
         pid = row.get("pid")
         context = row.get("context") or "proj"
+        if row.get("kind") == "pane":
+            self.spawn(self.internal(
+                "focus-pane", pid, context, row.get("tab_id"),
+                row.get("pane_index")))
+            return
         if row.get("kind") == "tab" and row.get("window") is not None:
             self.spawn(self.internal("activate", pid, context,
                                      row.get("window")))
@@ -1502,15 +2483,25 @@ class UIApp:
             self.spawn(self.internal("activate", pid, context))
 
     def toggle_row(self, row, expand=None):
-        if not row or row.get("kind") not in ("project", "task"):
+        if not row:
             return
-        if expand is None:
-            expand = not bool(row.get("expanded"))
-        verb = "expand" if expand else "collapse"
-        if row.get("kind") == "task":
-            self.spawn(self.internal(verb, row.get("pid"), row.get("tid")))
-        else:
-            self.spawn(self.internal(verb, row.get("pid")))
+        kind = row.get("kind")
+        if kind in ("project", "task"):
+            if expand is None:
+                expand = not bool(row.get("expanded"))
+            verb = "expand" if expand else "collapse"
+            if kind == "task":
+                self.spawn(self.internal(verb, row.get("pid"),
+                                         row.get("tid")))
+            else:
+                self.spawn(self.internal(verb, row.get("pid")))
+            return
+        if kind == "tab" and row.get("has_children"):
+            if expand is None:
+                expand = not bool(row.get("expanded"))
+            self.tab_expanded[row.get("key")] = bool(expand)
+            row["expanded"] = bool(expand)
+            self.dirty = True
 
     def new_task(self):
         row = self.current_row()
@@ -1542,29 +2533,30 @@ class UIApp:
             return
         pid = row.get("pid")
         tid = row.get("tid")
-        if not tid and row.get("kind") == "tab":
-            tid = row.get("tid")
         if pid and tid:
             self.spawn(self.internal("close-task", pid, tid))
 
     def move_cursor(self, delta):
         if not self.rows:
             return
-        self.cursor = clamp_cursor(self.cursor + delta, len(self.rows))
+        self.cursor = step_selectable(self.rows, self.cursor, delta)
         self.dirty = True
 
     def ensure_visible(self):
         if self.mode == "tree":
+            body_height = self._tree_body_height()
             indices, start = viewport_slice(
-                len(self.rows), self.cursor, self.tree_scroll, self.height)
+                len(self.rows), self.cursor, self.tree_scroll, body_height)
             self.tree_scroll = start
             if self.cursor not in [i for i in indices if i is not None]:
-                self.tree_scroll = max(0, self.cursor - self.height + 2)
+                self.tree_scroll = max(0, self.cursor - body_height + 2)
         else:
+            files = self.git_files_for_display()
             list_height = max(1, self.height - 2)
-            indices, start = viewport_slice(
-                max(1, len(self.git_files_for_display())), self.git_cursor,
-                self.git_scroll, list_height)
+            frames = git_frame_rows(files)
+            cursor_frame = git_frame_index(files, self.git_cursor) if files else 0
+            _indices, start = viewport_slice(
+                max(1, len(frames)), cursor_frame, self.git_scroll, list_height)
             self.git_scroll = start
 
     def git_files_for_display(self):
@@ -1581,29 +2573,59 @@ class UIApp:
         self.git_cursor = clamp_cursor(index, len(files))
         self.git_selected_path = files[self.git_cursor].get("path")
 
+    # -- help overlay -------------------------------------------------------
+    def open_help(self):
+        self.help_open = True
+        self.help_scroll = 0
+        self.dirty = True
+
+    def handle_help_key(self, name):
+        action, scroll = help_key_action(
+            name, self.help_scroll,
+            help_max_scroll(self.width, self.height))
+        if action == "close":
+            self.help_open = False
+            self.help_scroll = 0
+        elif action == "scroll":
+            self.help_scroll = scroll
+        self.dirty = True
+
+    def handle_help_mouse(self, b, x, y, pressed):
+        if b & 64:
+            direction = -1 if (b & 3) == 0 else 1
+            max_scroll = help_max_scroll(self.width, self.height)
+            self.help_scroll = max(
+                0, min(max_scroll, self.help_scroll + direction * 3))
+            self.dirty = True
+
     # -- tree events --------------------------------------------------------
     def handle_tree_key(self, name):
+        if name == "?":
+            self.open_help()
+            return
         if name in ("j", "Down"):
             self.move_cursor(1)
         elif name in ("k", "Up"):
             self.move_cursor(-1)
         elif name in ("g", "Home"):
-            if self.rows:
-                self.cursor = 0
+            usable = selectable_indices(self.rows)
+            if usable:
+                self.cursor = usable[0]
                 self.tree_scroll = 0
                 self.dirty = True
         elif name in ("G", "End"):
-            if self.rows:
-                self.cursor = len(self.rows) - 1
+            usable = selectable_indices(self.rows)
+            if usable:
+                self.cursor = usable[-1]
                 self.dirty = True
         elif name == "PgUp":
-            self.move_cursor(-max(1, self.height - 2))
+            self.move_cursor(-max(1, self._tree_body_height() - 2))
         elif name == "PgDn":
-            self.move_cursor(max(1, self.height - 2))
+            self.move_cursor(max(1, self._tree_body_height() - 2))
         elif name in ("h", "Left"):
             row = self.current_row()
-            if row and row.get("kind") in ("project", "task") and row.get(
-                    "expanded"):
+            if row and row.get("kind") in ("project", "task", "tab") and row.get(
+                    "expanded") and row.get("has_children"):
                 self.toggle_row(row, expand=False)
             else:
                 pk = parent_key(row)
@@ -1614,16 +2636,15 @@ class UIApp:
                         self.dirty = True
         elif name in ("l", "Right"):
             row = self.current_row()
-            if row and row.get("kind") in ("project", "task"):
+            if row and row.get("has_children") and row.get("kind") in (
+                    "project", "task", "tab"):
                 if not row.get("expanded"):
                     self.toggle_row(row, expand=True)
                 else:
-                    # Move into the first child, if it is currently visible.
-                    if self.rows and self.cursor + 1 < len(self.rows):
-                        child = self.rows[self.cursor + 1]
-                        if child.get("depth") == row.get("depth", 0) + 1:
-                            self.cursor += 1
-                            self.dirty = True
+                    child = first_child_index(self.rows, self.cursor)
+                    if child is not None:
+                        self.cursor = child
+                        self.dirty = True
         elif name == "Enter":
             self.activate_row(self.current_row())
         elif name == "n":
@@ -1661,10 +2682,11 @@ class UIApp:
         if b & 3 == 2:
             if pressed:
                 index = self._tree_row_at(row_y)
-                if index is not None:
+                if index is not None and self.rows[index].get(
+                        "kind") != "sep":
                     self.cursor = index
                     self.dirty = True
-                self.open_menu(self.current_row())
+                    self.open_menu(self.rows[index])
             return
         if b & 3 != 0:
             return
@@ -1682,8 +2704,9 @@ class UIApp:
         if index is None or index != pindex or py != row_y:
             return
         row = self.rows[index]
-        if (row.get("kind") in ("project", "task") and row.get("has_children")
-                and px <= int(row.get("depth") or 0) * 2 + 1):
+        if row.get("kind") == "sep":
+            return
+        if is_chevron_click(row, px):
             self.cursor = index
             self.toggle_row(row)
             self.dirty = True
@@ -1697,12 +2720,16 @@ class UIApp:
 
     def _tree_row_at(self, row_y):
         indices, _start = viewport_slice(
-            len(self.rows), self.cursor, self.tree_scroll, self.height)
+            len(self.rows), self.cursor, self.tree_scroll,
+            self._tree_body_height())
         return hit_test(row_y, indices)
 
     # -- git events ---------------------------------------------------------
     def handle_git_key(self, name):
         files = self.git_files_for_display()
+        if name == "?":
+            self.open_help()
+            return
         if name in ("j", "Down"):
             if files:
                 self.git_select(self.git_cursor + 1)
@@ -1735,39 +2762,36 @@ class UIApp:
             pass
         else:
             return
-        list_height = max(1, self.height - 2)
-        if files:
-            indices, start = viewport_slice(
-                len(files), self.git_cursor, self.git_scroll, list_height)
-            self.git_scroll = start
+        self.ensure_visible()
 
     def handle_git_mouse(self, b, x, y, pressed):
         row_y = max(0, y - 1)
+        files = self.git_files_for_display()
         if b & 64:
             direction = -1 if (b & 3) == 0 else 1
-            files = self.git_files_for_display()
             if files:
                 self.git_select(self.git_cursor + direction * 3)
                 self.dirty = True
-                list_height = max(1, self.height - 2)
-                _indices, start = viewport_slice(
-                    len(files), self.git_cursor, self.git_scroll, list_height)
-                self.git_scroll = start
+                self.ensure_visible()
             return
         if b & 3 != 0 or not pressed:
             return
-        if row_y < 2:
+        if row_y < 1:
             return
-        files = self.git_files_for_display()
         if not files:
             return
         list_height = max(1, self.height - 2)
+        frames = git_frame_rows(files)
         indices, _start = viewport_slice(
-            len(files), self.git_cursor, self.git_scroll, list_height)
-        index = hit_test(row_y - 2, indices)
-        if index is None:
+            len(frames), git_frame_index(files, self.git_cursor),
+            self.git_scroll, list_height)
+        frame_index = hit_test(row_y - 1, indices)
+        if frame_index is None:
             return
-        self.git_select(index)
+        frame = frames[frame_index]
+        if frame.get("kind") != "file":
+            return
+        self.git_select(frame.get("index") or 0)
         self.dirty = True
         self.open_git_file()
 
@@ -1793,6 +2817,14 @@ class UIApp:
         if self.mode == "git" and active and was_active is False:
             # The window just became active: do not wait for the next tick.
             self.git_fetched_at = 0.0
+        if self.mode == "tree" and active and os.environ.get("TMUX"):
+            # Adopt native splits once per active-window poll.  A split shows
+            # up within roughly one refresh (1 s).  Fire and forget: the
+            # backend debounces unchanged pane sets, and a failed sync is
+            # retried on the next poll.
+            if self.sync_proc is None or self.sync_proc.poll() is not None:
+                self.sync_proc = self.spawn(self.internal("sync"), track=False,
+                                            quiet=True)
         state, error = read_state_file(self.state_path)
         self.state = state
         if self.mode == "tree":
@@ -1804,7 +2836,7 @@ class UIApp:
                 if self.rows:
                     old_key = self.rows[clamp_cursor(
                         self.cursor, len(self.rows))].get("key")
-                self.rows = build_rows(state, live)
+                self.rows = build_rows(state, live, self.tab_expanded)
                 if old_key:
                     index = find_row(self.rows, old_key)
                     if index is not None:
@@ -1814,6 +2846,8 @@ class UIApp:
                 elif self.rows:
                     self.cursor = self._initial_cursor()
                 self.cursor = clamp_cursor(self.cursor, len(self.rows))
+                if self.rows and self.rows[self.cursor].get("kind") == "sep":
+                    self.cursor = step_selectable(self.rows, self.cursor, 1)
                 self.dirty = True
             else:
                 self.tree_error = error or "state unavailable"
@@ -1965,13 +2999,18 @@ class UIApp:
                     continue
                 if name == "FocusOut":
                     continue
+                if self.help_open:
+                    self.handle_help_key(name)
+                    continue
                 if self.mode == "tree":
                     self.handle_tree_key(name)
                 else:
                     self.handle_git_key(name)
             elif event[0] == "mouse":
                 _tag, b, x, y, pressed = event
-                if self.mode == "tree":
+                if self.help_open:
+                    self.handle_help_mouse(b, x, y, pressed)
+                elif self.mode == "tree":
                     self.handle_tree_mouse(b, x, y, pressed)
                 else:
                     self.handle_git_mouse(b, x, y, pressed)
@@ -1990,7 +3029,9 @@ class UIApp:
                 self.esc_deadline = None
                 for event in events:
                     if event[0] == "key":
-                        if self.mode == "tree":
+                        if self.help_open:
+                            self.handle_help_key(event[1])
+                        elif self.mode == "tree":
                             self.handle_tree_key(event[1])
                         else:
                             self.handle_git_key(event[1])
@@ -2067,6 +3108,11 @@ class UIApp:
                         proc.terminate()
                     except OSError:
                         pass
+            if self.sync_proc is not None and self.sync_proc.poll() is None:
+                try:
+                    self.sync_proc.terminate()
+                except OSError:
+                    pass
             self.leave_terminal()
             if self._wake_registered:
                 try:

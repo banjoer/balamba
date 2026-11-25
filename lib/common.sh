@@ -88,6 +88,8 @@ balamba_config_defaults() {
   default_ref=origin/main
   default_agent=opencode
   restore_stagger=${BALAMBA_RESTORE_STAGGER:-1}
+  theme=auto
+  accent=blue
 
   declare -gA BALAMBA_AGENT_COMMAND=()
   declare -gA BALAMBA_AGENT_RESUME=()
@@ -153,6 +155,14 @@ balamba_config_validate() {
   [[ -n ${editor-} ]] || bad+=("editor must not be empty")
   [[ -n ${default_ref-} ]] || bad+=("default_ref must not be empty")
   [[ -n ${default_agent-} ]] || bad+=("default_agent must not be empty")
+  case ${theme-} in
+    auto|truecolor|256|16) ;;
+    *) bad+=("theme must be auto, truecolor, 256 or 16 (got '${theme-}')") ;;
+  esac
+  case ${accent-} in
+    blue|cyan|magenta|yellow) ;;
+    *) bad+=("accent must be blue, cyan, magenta or yellow (got '${accent-}')") ;;
+  esac
   if [[ ! ${restore_stagger-} =~ ^[0-9]+$ ]]; then
     bad+=("restore_stagger must be an integer (got '${restore_stagger-}')")
   elif (( restore_stagger > 60 )); then
@@ -189,6 +199,8 @@ balamba_config_to_tmux() {
     set -g @balamba_editor "$editor" \; \
     set -g @balamba_default_ref "$default_ref" \; \
     set -g @balamba_default_agent "$default_agent" \; \
+    set -g @balamba_theme "$theme" \; \
+    set -g @balamba_accent "$accent" \; \
     set -g @balamba_root "$BALAMBA_ROOT"
 }
 

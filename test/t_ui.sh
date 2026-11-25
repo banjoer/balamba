@@ -67,6 +67,9 @@ start_server() {
   tsess set -g @balamba_active_refresh 1 >/dev/null 2>&1 || true
   tsess set -g @balamba_idle_refresh 1 >/dev/null 2>&1 || true
   tsess set -g @balamba_git_refresh 1 >/dev/null 2>&1 || true
+  # Deterministic palette for the colour assertions (256-colour fallback).
+  tsess set -g @balamba_theme 256 >/dev/null 2>&1 || true
+  tsess set -g @balamba_accent blue >/dev/null 2>&1 || true
 }
 
 # new_ui_pane <mode> <root> <state> [width] [height]
@@ -110,12 +113,32 @@ wait_log_contains() {
   return 1
 }
 
-# 1-based line number of the reverse-video (selected) row.
-reverse_line() {
+wait_not_contains() {
+  local pane=$1 needle=$2 tries=${3:-100} i text
+  for ((i = 0; i < tries; i++)); do
+    text=$(capture "$pane")
+    [[ $text != *"$needle"* ]] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+# The tree polls the background sync once per active poll; it is noise for
+# assertions about user actions.
+fake_actions() {
+  grep -v -x 'internal sync' "$FAKE_LOG" 2>/dev/null || true
+}
+
+# 1-based line number of the accent-bar (selected) row.
+selected_line() {
   local pane=$1
-  capture_e "$pane" | awk -v esc=$'\033' '
-    index($0, esc "[7m") || index($0, ";7m") { print NR; exit }
-  '
+  capture "$pane" | awk 'index($0, "▌") == 1 { print NR; exit }'
+}
+
+# ANSI-aware presence checks (the palette emits full SGR sequences).
+ansi_has() {
+  local text=$1 pattern=$2
+  printf '%s' "$text" | grep -Eq -- "$pattern"
 }
 
 pane_alive() {
@@ -188,6 +211,9 @@ tmux_server_up >/dev/null 2>&1 || true
 tsess set -g @balamba_active_refresh 1 >/dev/null 2>&1 || true
 tsess set -g @balamba_idle_refresh 5 >/dev/null 2>&1 || true
 tsess set -g @balamba_git_refresh 1 >/dev/null 2>&1 || true
+# tmux_server_up mirrors the (default) user config, so reassert the palette.
+tsess set -g @balamba_theme 256 >/dev/null 2>&1 || true
+tsess set -g @balamba_accent blue >/dev/null 2>&1 || true
 TREE_STATE=$CASE/state/tree.json
 write_tree_state "$TREE_STATE"
 balamba_state_validate "$TREE_STATE" >/dev/null 2>&1
@@ -212,15 +238,38 @@ assert_contains "$TEXT" "Docs pass" "tree: renders a collapsed task row"
 assert_contains "$TEXT" "beta" "tree: renders other projects"
 assert_not_contains "$TEXT" "Beta work" "tree: collapsed project hides its tasks"
 
-assert_eq "3" "$(reverse_line "$TREE_PANE")" \
-  "tree: the active task row is selected and reverse-video highlighted"
+assert_eq "3" "$(selected_line "$TREE_PANE")" \
+  "tree: the active task row uses the accent selection bar"
+assert_contains "$TEXT" "? help" "tree: footer offers contextual help"
+assert_contains "$TEXT" "d close" "tree: task footer advertises close"
+assert_contains "$TEXT" "r-click" "tree: tall footer documents the mouse"
+TREE_E=$(capture_e "$TREE_PANE")
+if ansi_has "$TREE_E" $'\033\[[0-9;]*38;5;75m'; then
+  _pass "tree: active rows use the blue accent"
+else
+  _fail "tree: active rows use the blue accent" "no 38;5;75 in capture"
+fi
+if ansi_has "$TREE_E" $'\033\[(32|38;5;2)m'; then
+  _fail "tree: no green on non-git rows" "green SGR found in the tree"
+else
+  _pass "tree: no green on non-git rows"
+fi
 
 # Unread marker from window_activity_flag.  Create a real window for tty_p1,
 # put it in the background and make it produce output (monitor-activity on).
-tsess new-window -d -t balamba: -n unread -c "$CASE" \
-  "tmux -L $BALAMBA_SOCKET set-option -w -t \"\$TMUX_PANE\" @balamba_tab tty_p1; printf x; sleep 120" \
-  >/dev/null 2>&1 || true
-sleep 2.2
+UNREAD_WIN=$(tsess new-window -d -P -F '#{window_id}' -t balamba: -n unread \
+  -c "$CASE" \
+  "tmux -L $BALAMBA_SOCKET set-option -w -t \"\$TMUX_PANE\" @balamba_tab tty_p1; tmux -L $BALAMBA_SOCKET set-option -w -t \"\$TMUX_PANE\" @balamba_context proj; printf x; sleep 300" \
+  2>/dev/null) || true
+UNREAD_FLAG=""
+for _i in $(seq 1 100); do
+  UNREAD_FLAG=$(tsess display -p -t "$UNREAD_WIN" \
+    '#{window_activity_flag}' 2>/dev/null || true)
+  [[ $UNREAD_FLAG == 1 ]] && break
+  sleep 0.05
+done
+assert_eq "1" "$UNREAD_FLAG" "fixture: background window activity is flagged"
+wait_contains "$TREE_PANE" "●" 100 || true
 TEXT=$(capture "$TREE_PANE")
 assert_contains "$TEXT" "●" "tree: unread marker propagated to the parent project"
 assert_not_contains "$(capture_e "$TREE_PANE" | sed -n '3p')" "●" \
@@ -232,10 +281,20 @@ assert_not_contains "$(capture_e "$TREE_PANE" | sed -n '3p')" "●" \
 : >"$FAKE_LOG"
 send_literal "$TREE_PANE" "j"
 sleep 0.15
-assert_eq "4" "$(reverse_line "$TREE_PANE")" "tree: j moves the selection down"
+assert_eq "4" "$(selected_line "$TREE_PANE")" "tree: j moves the selection down"
 send_literal "$TREE_PANE" "k"
 sleep 0.15
-assert_eq "3" "$(reverse_line "$TREE_PANE")" "tree: k moves the selection back"
+assert_eq "3" "$(selected_line "$TREE_PANE")" "tree: k moves the selection back"
+
+# The footer changes with the selected row kind.
+send_literal "$TREE_PANE" "g"
+sleep 0.15
+assert_contains "$(capture "$TREE_PANE")" "n task" \
+  "tree: project footer advertises the new task key"
+send_click "$TREE_PANE" 3 3
+sleep 0.2
+assert_eq "3" "$(selected_line "$TREE_PANE")" \
+  "tree: click restores the task selection for the Enter test"
 
 : >"$FAKE_LOG"
 send_key "$TREE_PANE" Enter
@@ -247,10 +306,10 @@ fi
 
 # First click selects, second click on the same row activates.
 : >"$FAKE_LOG"
-send_click "$TREE_PANE" 3 1
+send_click "$TREE_PANE" 6 1
 sleep 0.2
-assert_eq "1" "$(reverse_line "$TREE_PANE")" "tree: click selects the project row"
-send_click "$TREE_PANE" 3 1
+assert_eq "1" "$(selected_line "$TREE_PANE")" "tree: click selects the project row"
+send_click "$TREE_PANE" 6 1
 if wait_log_contains "internal activate p_alpha proj"; then
   _pass "tree: clicking the selected project activates its context"
 else
@@ -260,7 +319,7 @@ fi
 
 # Chevron click toggles expand/collapse through the internal verbs.
 : >"$FAKE_LOG"
-send_click "$TREE_PANE" 1 1
+send_click "$TREE_PANE" 2 1
 if wait_log_contains "internal collapse p_alpha"; then
   _pass "tree: chevron click collapses the project"
 else
@@ -337,7 +396,44 @@ send_literal "$TREE_PANE" "q"
 sleep 0.3
 assert_status 0 "tree: r/q leave the pane running" pane_alive "$TREE_PANE"
 assert_contains "$(capture "$TREE_PANE")" "alpha" "tree: r keeps the content"
-assert_eq "" "$(cat "$FAKE_LOG")" "tree: q is a no-op"
+assert_eq "" "$(fake_actions)" "tree: q is a no-op"
+
+# '?' opens the in-pane help overlay; ? / q / Esc close it.  j/k/G scroll it.
+send_literal "$TREE_PANE" "?"
+if wait_contains "$TREE_PANE" "NAVIGATION"; then
+  _pass "help: ? opens the in-pane overlay"
+else
+  _fail "help: ? opens the in-pane overlay" "$(capture "$TREE_PANE")"
+fi
+HELP_TEXT=$(capture "$TREE_PANE")
+assert_contains "$HELP_TEXT" "? close · j/k scroll" "help: footer switches to close/scroll"
+send_literal "$TREE_PANE" "G"
+if wait_contains "$TREE_PANE" "DIFF / COPY"; then
+  _pass "help: G scrolls to the last section"
+else
+  _fail "help: G scrolls to the last section" "$(capture "$TREE_PANE")"
+fi
+send_literal "$TREE_PANE" "q"
+if wait_not_contains "$TREE_PANE" "NAVIGATION" 120; then
+  _pass "help: q dismisses the overlay"
+else
+  _fail "help: q dismisses the overlay" "$(capture "$TREE_PANE")"
+fi
+if wait_contains "$TREE_PANE" "alpha" 60; then
+  _pass "help: the tree is intact after closing the overlay"
+else
+  _fail "help: the tree is intact after closing the overlay" \
+    "$(capture "$TREE_PANE")"
+fi
+send_literal "$TREE_PANE" "?"
+wait_contains "$TREE_PANE" "NAVIGATION" || true
+send_literal "$TREE_PANE" "$(printf '\033')"
+if wait_not_contains "$TREE_PANE" "NAVIGATION" 120; then
+  _pass "help: Esc dismisses the overlay"
+else
+  _fail "help: Esc dismisses the overlay" "$(capture "$TREE_PANE")"
+fi
+assert_status 0 "help: overlay never kills the pane" pane_alive "$TREE_PANE"
 
 kill_pane "$TREE_PANE"
 
@@ -398,6 +494,133 @@ assert_eq "false" \
   "internal collapse: task flag changes"
 
 # ---------------------------------------------------------------------------
+# Split tab: tab row plus pane rows, collapse, pane focus
+# ---------------------------------------------------------------------------
+SPLIT_STATE=$CASE/state/split.json
+cat >"$SPLIT_STATE" <<EOF
+{"version":1,
+ "active":{"project":"p_split","context":"task:t_split","window":1},
+ "projects":[{"id":"p_split","name":"splitproj","path":"$ALPHA","expanded":true,
+  "tabs":[],"tasks":[
+   {"id":"t_split","name":"Split task","slug":"split","path":"$ALPHA/fix-login",
+    "branch":"split","base_ref":"origin/main",
+    "created_at":"2026-01-01T00:00:00Z","expanded":true,
+    "tabs":[{"id":"tty_split","name":"split tab","kind":"shell","agent":null,
+     "session":null,"window":1,"pane_count":2,"layout":"","active_pane":0,
+     "panes":[
+      {"index":0,"cwd":"$ALPHA/fix-login","launched":"shell","name":"zsh",
+       "live_command":"zsh","active":true},
+      {"index":1,"cwd":"$ALPHA/fix-login","launched":"shell","name":"nvim",
+       "live_command":"nvim","active":false}]}]}]}]}
+EOF
+balamba_state_validate "$SPLIT_STATE" >/dev/null 2>&1
+assert_status 0 "fixture: split state is valid" balamba_state_validate "$SPLIT_STATE"
+
+SPLIT_PANE=$(new_ui_pane tree "$FAKE_ROOT" "$SPLIT_STATE" 44 16)
+tsess select-window -t "$SPLIT_PANE" >/dev/null 2>&1 || true
+if wait_contains "$SPLIT_PANE" "split tab"; then
+  _pass "split tab: renders the tab row"
+else
+  _fail "split tab: renders the tab row" "$(capture "$SPLIT_PANE")"
+fi
+SPLIT_TEXT=$(capture "$SPLIT_PANE")
+assert_contains "$SPLIT_TEXT" "▾ split tab" "split tab: expanded chevron on the tab row"
+assert_contains "$SPLIT_TEXT" "2 panes" "split tab: dim pane count"
+assert_contains "$SPLIT_TEXT" "· zsh" "split tab: first pane row"
+assert_contains "$SPLIT_TEXT" "· nvim" "split tab: second pane row"
+assert_eq "2" "$(selected_line "$SPLIT_PANE")" \
+  "split tab: the active task row owns the cursor"
+send_literal "$SPLIT_PANE" "j"
+sleep 0.15
+assert_eq "3" "$(selected_line "$SPLIT_PANE")" \
+  "split tab: j moves to the tab row"
+assert_contains "$(capture "$SPLIT_PANE")" "l panes" \
+  "split tab: tab footer advertises pane toggle"
+send_literal "$SPLIT_PANE" "h"
+if wait_not_contains "$SPLIT_PANE" "· nvim" 120; then
+  _pass "split tab: h collapses the pane rows"
+else
+  _fail "split tab: h collapses the pane rows" "$(capture "$SPLIT_PANE")"
+fi
+assert_contains "$(capture "$SPLIT_PANE")" "▸ split tab" \
+  "split tab: collapsed tab switches to the closed chevron"
+send_literal "$SPLIT_PANE" "l"
+if wait_contains "$SPLIT_PANE" "· nvim" 120; then
+  _pass "split tab: l expands the pane rows again"
+else
+  _fail "split tab: l expands the pane rows again" "$(capture "$SPLIT_PANE")"
+fi
+send_literal "$SPLIT_PANE" "j"
+sleep 0.15
+assert_eq "4" "$(selected_line "$SPLIT_PANE")" \
+  "split tab: j moves onto the first pane row"
+PANE_FOOTER=$(capture "$SPLIT_PANE")
+assert_contains "$PANE_FOOTER" "enter focus" \
+  "split tab: pane footer advertises focus"
+: >"$FAKE_LOG"
+send_key "$SPLIT_PANE" Enter
+if wait_log_contains "internal focus-pane p_split task:t_split tty_split 0"; then
+  _pass "split tab: Enter on a pane focuses that content pane"
+else
+  _fail "split tab: Enter on a pane focuses that content pane" \
+    "$(fake_actions)"
+fi
+kill_pane "$SPLIT_PANE"
+
+# ---------------------------------------------------------------------------
+# Native split adoption: the active tree sync poll adds the new pane row
+# ---------------------------------------------------------------------------
+NATIVE_WIN=$(tsess new-window -d -P -F '#{window_id}' -t balamba: -n native \
+  'sleep 300') || true
+NATIVE_INDEX=$(tsess display -p -t "$NATIVE_WIN" '#{window_index}')
+tsess set-option -w -t "$NATIVE_WIN" @balamba_tab tty_native >/dev/null 2>&1 || true
+# internal sync requires a non-empty context on a tagged window.
+tsess set-option -w -t "$NATIVE_WIN" @balamba_context proj >/dev/null 2>&1 || true
+tsess set-option -w -t "$NATIVE_WIN" @balamba_project p_native >/dev/null 2>&1 || true
+NATIVE_STATE=$CASE/state/native.json
+cat >"$NATIVE_STATE" <<EOF
+{"version":1,
+ "active":{"project":"p_native","context":"proj","window":$NATIVE_INDEX},
+ "projects":[{"id":"p_native","name":"native","path":"$CASE","expanded":true,
+  "tabs":[{"id":"tty_native","name":"native tab","kind":"shell","agent":null,
+   "session":null,"window":$NATIVE_INDEX,"pane_count":1,"layout":"",
+   "active_pane":0,
+   "panes":[{"index":0,"cwd":"$CASE","launched":"shell","name":"sleep",
+             "live_command":"sleep","active":true}]}],
+  "tasks":[]}]}
+EOF
+balamba_state_validate "$NATIVE_STATE" >/dev/null 2>&1
+assert_status 0 "fixture: native state is valid" balamba_state_validate "$NATIVE_STATE"
+
+NATIVE_PANE_UI=$(new_ui_pane tree "$BALAMBA_ROOT" "$NATIVE_STATE" 44 18)
+tsess select-window -t "$NATIVE_PANE_UI" >/dev/null 2>&1 || true
+if wait_contains "$NATIVE_PANE_UI" "native tab" 120; then
+  _pass "native split: tree renders the tab before the split"
+else
+  _fail "native split: tree renders the tab before the split" \
+    "$(capture "$NATIVE_PANE_UI")"
+fi
+FIRST_CONTENT=$(tsess list-panes -t "$NATIVE_WIN" -F '#{pane_id}' | head -1)
+tsess split-window -d -t "$FIRST_CONTENT" 'exec cat' >/dev/null 2>&1 || true
+if wait_contains "$NATIVE_PANE_UI" "· cat" 200; then
+  _pass "native split: the sync poll adopts and renders the new pane"
+else
+  _fail "native split: the sync poll adopts and renders the new pane" \
+    "$(capture "$NATIVE_PANE_UI")"
+fi
+if wait_contains "$NATIVE_PANE_UI" "2 panes" 100; then
+  _pass "native split: the tab row picks up the new pane count"
+else
+  _fail "native split: the tab row picks up the new pane count" \
+    "$(capture "$NATIVE_PANE_UI")"
+fi
+assert_eq "2" \
+  "$(jq -r '.projects[0].tabs[0].pane_count' "$NATIVE_STATE" 2>/dev/null || true)" \
+  "native split: state records the adopted pane"
+kill_pane "$NATIVE_PANE_UI"
+tsess kill-window -t "$NATIVE_WIN" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
 # Corrupt / empty / tiny panes
 # ---------------------------------------------------------------------------
 BAD_STATE=$CASE/state/corrupt.json
@@ -445,6 +668,7 @@ git -C "$GIT_REPO" config user.email "ui@balamba.invalid"
 git -C "$GIT_REPO" config commit.gpgsign false
 printf 'one\n' >"$GIT_REPO/README.md"
 printf 'old\n' >"$GIT_REPO/old.txt"
+printf 'gone\n' >"$GIT_REPO/gone.txt"
 mkdir -p -- "$GIT_REPO/src/deep/nested"
 printf 'long\n' >"$GIT_REPO/src/deep/nested/very_long_filename_example.txt"
 git -C "$GIT_REPO" add -A
@@ -455,6 +679,7 @@ printf 'two\n' >>"$GIT_REPO/README.md"
 printf 'staged\n' >"$GIT_REPO/staged file.txt"
 git -C "$GIT_REPO" add "staged file.txt"
 git -C "$GIT_REPO" mv old.txt renamed.txt
+rm -f -- "$GIT_REPO/gone.txt"
 printf 'new\n' >"$GIT_REPO/new file ü.txt"
 printf 'more\n' >>"$GIT_REPO/src/deep/nested/very_long_filename_example.txt"
 git -C "$GIT_REPO" add "src/deep/nested/very_long_filename_example.txt"
@@ -481,29 +706,49 @@ else
 fi
 GIT_TEXT=$(capture "$GIT_PANE")
 assert_contains "$GIT_TEXT" "main" "git: branch line"
+assert_contains "$GIT_TEXT" "Staged " "git: staged section header"
+assert_contains "$GIT_TEXT" "Unstaged " "git: unstaged section header"
+assert_contains "$GIT_TEXT" "Untracked " "git: untracked section header"
 assert_contains "$GIT_TEXT" " M README.md" "git: unstaged code and path"
 assert_contains "$GIT_TEXT" "A  staged file.txt" "git: staged code and path with a space"
-assert_contains "$GIT_TEXT" "?? new file ü.txt" "git: untracked code and unicode path"
+assert_contains "$GIT_TEXT" "?  new file ü.txt" "git: untracked single ? and unicode path"
+assert_contains "$GIT_TEXT" "D gone.txt" "git: deleted code and path"
 assert_contains "$GIT_TEXT" "renamed.txt" "git: rename shows the new path"
 assert_contains "$GIT_TEXT" "old.txt" "git: rename shows the original path"
 assert_contains "$GIT_TEXT" "very_long_filename_example.txt" \
   "git: long path keeps its filename tail"
+assert_contains "$GIT_TEXT" "enter diff · r refresh" "git: footer advertises diff/refresh"
 
-# Selected row is reverse-video; j/k move it.
-FIRST_REVERSE=$(grep -n '' <<<"$(capture_e "$GIT_PANE")" | awk -v esc=$'\033' '
-  index($0, esc "[7m") || index($0, ";7m") { print $1; exit }' | cut -d: -f1)
-check_first=${FIRST_REVERSE:-0}
+GIT_E=$(capture_e "$GIT_PANE")
+if ansi_has "$GIT_E" $'\033\[[0-9;]*38;5;71m'; then
+  _pass "git: added files use the green badge"
+else
+  _fail "git: added files use the green badge" "no add colour in capture"
+fi
+if ansi_has "$GIT_E" $'\033\[[0-9;]*38;5;178m'; then
+  _pass "git: modified files use the amber badge"
+else
+  _fail "git: modified files use the amber badge" "no modify colour in capture"
+fi
+if ansi_has "$GIT_E" $'\033\[[0-9;]*38;5;203m'; then
+  _pass "git: deleted files use the red badge"
+else
+  _fail "git: deleted files use the red badge" "no delete colour in capture"
+fi
+
+# Selected row uses the accent bar; j/k move it.
+FIRST_SELECTED=$(selected_line "$GIT_PANE")
+check_first=${FIRST_SELECTED:-0}
 if ((check_first >= 3)); then
   _pass "git: a file row is selected and highlighted"
 else
   _fail "git: a file row is selected and highlighted" \
-    "reverse line: ${FIRST_REVERSE:-none}"
+    "selected line: ${FIRST_SELECTED:-none}"
 fi
 send_literal "$GIT_PANE" "j"
 sleep 0.3
-SECOND_REVERSE=$(capture_e "$GIT_PANE" | awk -v esc=$'\033' '
-  index($0, esc "[7m") || index($0, ";7m") { print NR; exit }')
-assert_ne "$FIRST_REVERSE" "$SECOND_REVERSE" "git: j moves the file selection"
+SECOND_SELECTED=$(selected_line "$GIT_PANE")
+assert_ne "$FIRST_SELECTED" "$SECOND_SELECTED" "git: j moves the file selection"
 send_literal "$GIT_PANE" "k"
 sleep 0.2
 
@@ -614,10 +859,16 @@ cat >"$CLEAN_STATE" <<EOF
 EOF
 CLEAN_PANE=$(new_ui_pane git "$BALAMBA_ROOT" "$CLEAN_STATE" 40 12)
 tsess select-window -t "$CLEAN_PANE" >/dev/null 2>&1 || true
-if wait_contains "$CLEAN_PANE" "clean" 300; then
-  _pass "git: clean repository shows clean"
+if wait_contains "$CLEAN_PANE" "working tree clean" 300; then
+  _pass "git: clean repository says working tree clean"
 else
-  _fail "git: clean repository shows clean" "$(capture "$CLEAN_PANE")"
+  _fail "git: clean repository says working tree clean" "$(capture "$CLEAN_PANE")"
+fi
+if ansi_has "$(capture_e "$CLEAN_PANE")" $'\033\[[0-9;]*38;5;71m' ||
+   ansi_has "$(capture_e "$CLEAN_PANE")" $'\033\[32m'; then
+  _fail "git: clean state is not a green banner" "green SGR in clean pane"
+else
+  _pass "git: clean state is not a green banner"
 fi
 kill_pane "$CLEAN_PANE"
 
@@ -641,10 +892,11 @@ cat >"$DETACHED_STATE" <<EOF
 EOF
 DETACHED_PANE=$(new_ui_pane git "$BALAMBA_ROOT" "$DETACHED_STATE" 40 12)
 tsess select-window -t "$DETACHED_PANE" >/dev/null 2>&1 || true
-if wait_contains "$DETACHED_PANE" "detached HEAD" 300; then
-  _pass "git: detached HEAD is labelled"
+if wait_contains "$DETACHED_PANE" "detached @ " 300; then
+  _pass "git: detached HEAD is labelled with its short sha"
 else
-  _fail "git: detached HEAD is labelled" "$(capture "$DETACHED_PANE")"
+  _fail "git: detached HEAD is labelled with its short sha" \
+    "$(capture "$DETACHED_PANE")"
 fi
 kill_pane "$DETACHED_PANE"
 
@@ -696,12 +948,14 @@ if wait_contains "$RESIZE_PANE" "alpha"; then
 else
   _fail "resize: pane rendered before the resize" "$(capture "$RESIZE_PANE")"
 fi
-tsess resize-window -t "$RESIZE_PANE" -x 24 -y 9 >/dev/null 2>&1 || true
+tsess resize-window -t "$RESIZE_PANE" -x 24 -y 10 >/dev/null 2>&1 || true
 sleep 0.5
 RESIZE_TEXT=$(capture "$RESIZE_PANE")
 RESIZE_WIDTH=$(tsess display -p -t "$RESIZE_PANE" '#{pane_width}')
 assert_eq "24" "$RESIZE_WIDTH" "resize: pane width changed"
 assert_contains "$RESIZE_TEXT" "alpha" "resize: content survives SIGWINCH repaint"
+assert_contains "$RESIZE_TEXT" "? help" "resize: 24x10 tree keeps its footer"
+assert_status 0 "resize: 24x10 tree stays alive" pane_alive "$RESIZE_PANE"
 LONG_LINE=$(printf '%s\n' "$RESIZE_TEXT" | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')
 if ((LONG_LINE <= 24)); then
   _pass "resize: repainted lines fit the new width"

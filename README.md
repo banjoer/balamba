@@ -9,14 +9,45 @@ that touches tmux uses `tmux -L balamba`; a bare `tmux` command still means the
 user's usual server.
 
 ```
-┌──────────────┬────────────────────────────┬─────────────────┐
-│ tree   (~30) │ tab content (splits)       │ git      (~34)  │
-│ projects     │                            │ branch, ahead   │
-│  └ tasks     │                            │ changed files   │
-│     └ terms  │                            │                 │
-└──────────────┴────────────────────────────┴─────────────────┘
+┌──────────────────┬──────────────────────────┬──────────────────┐
+│ tree     (~30)   │ tab content (splits)     │ git      (~34)   │
+│ ▾ balamba 2 tasks│                          │ fix-login ↑2     │
+│   ▾ Fix login    │                          │ Staged 2         │
+│     ◆ agent      │                          │ A  src/app.py    │
+│     ▾ shell 2    │                          │ Unstaged 1       │
+│       · zsh      │                          │  M README.md     │
+│       · nvim     │                          │ ?  notes.txt     │
+│ ──────────────── │                          │ Untracked 1      │
+│ ▸ other project  │                          │                  │
+│ ? help · enter … │                          │ enter diff · r … │
+└──────────────────┴──────────────────────────┴──────────────────┘
   status bar (bottom): balamba · <context>            [tab] [tab]
 ```
+
+The chrome is deliberately calm: neutral text, one blue accent for the active
+context and the selection bar, dim secondary text, and amber unread dots.
+Green and red are reserved for git file codes. `theme` and `accent` in the
+config select 24-bit, 256-colour or 16-colour output.
+
+The tree shows the whole hierarchy and collapses noise:
+
+- `▾`/`▸` project or task, with the task count dim at the right.
+- A dim rule separates project groups.
+- A tab with **one** content pane is one row: `◆` agent or `›` shell, its name,
+  and the live command when that differs.
+- A tab with **two or more** panes keeps a `▾`/`▸` tab row with a dim pane
+  count, followed by `·` pane rows. `h`/`l` (or a chevron click) collapse and
+  expand them.
+- The selected row has a blue `▌` bar and a dark background; the active
+  context/tab is blue bold text, never a full green row.
+- A dim footer pinned to the bottom lists three or four actions for the
+  selected row (fewer at very narrow widths, so the most important ones stay
+  readable); when the pane is tall enough it adds the mouse line
+  `click select · again open · r-click menu`, compacted at narrow widths.
+
+Splits created with native tmux (`C-a %`, `C-a "`) are adopted by the tree's
+poll (within about a second) and show up as pane rows; clicking one focuses
+that content pane.
 
 One tmux session `balamba`; each terminal tab is a tmux window; splits inside a
 tab are native tmux panes. The tree and git panes are replicated per window and
@@ -67,8 +98,9 @@ Put the repository anywhere; no `pip`, no packages.
    target main.
 
 3. **Work.** Edit files in the task worktree. The right-hand git pane lists the
-   branch, ahead/behind and changed files; Enter on a file opens a diff popup.
-   Use native tmux splits (`C-a %`, `C-a "`).
+   branch, ahead/behind and staged/unstaged/untracked files; Enter on a file
+   opens a diff popup. Use native tmux splits (`C-a %`, `C-a "`); the new panes
+   appear under the tab in the tree, and clicking one focuses it.
 
 4. **Open another terminal.** Press `C-a T` (or `t` in the tree) and choose
    `agent` or `shell`. You can also attach a second client from another
@@ -94,25 +126,38 @@ Prefix is `C-a` (rebindable in `tmux.conf`).
 | `C-a r` | redraw the client |
 | `C-a [` | enter copy-mode (see mouse caveat below) |
 | `C-a %`, `C-a "` | split content horizontally / vertically |
+| `C-a z` | zoom the current pane |
 | `C-a 1..9`, `C-a n/p` | select tab/window |
 
 ### Tree keys (when the tree pane is focused)
 
 | Key | Action |
 |---|---|
-| `j` / `k`, arrows | move selection |
+| `j` / `k`, arrows | move selection (separator rules are skipped) |
 | `g` / `G`, Home/End | top / bottom |
-| `h` / `l`, Left/Right | collapse/expand, or move to parent/first child |
-| `Enter` | activate the selected project/task/tab |
+| `h` / `l`, Left/Right | collapse/expand a project, task or split tab, or move to parent/first child |
+| `Enter` | activate the selected project/task/tab, or focus the selected pane |
 | `n` | new task in the selected project |
 | `t` | new terminal in the selected project/task |
 | `d` | close the selected task (dialog) |
 | `e` | open the selected worktree in the editor |
 | `p` | add project |
+| `?` | open the in-pane help overlay (`?`, `Esc` or `q` closes; `j`/`k` scroll) |
 | `r` | force a refresh (also redraw data) |
-| `q` | no-op (reserved) |
+| `q` | no-op in the tree (closes help when it is open) |
+
+The footer under the tree is contextual: a project offers `n task`, a task
+offers `d close`, a split tab offers `l panes`, and a pane row offers
+`enter focus`. The footer never advertises a key that does nothing for the
+selected row. The `?` overlay documents navigation, sessions, mouse, tmux
+splits/zoom/detach and diff/copy-mode, including the text-selection caveat.
 
 ### Git pane keys
+
+The git pane groups files into `Staged`, `Unstaged`, `Untracked` (and
+`Conflicts` when present), each with a dim count. The XY badge is coloured by
+state (green added, amber modified, red deleted/conflict); the path stays
+normal text and untracked files use a single `?` badge.
 
 | Key | Action |
 |---|---|
@@ -120,20 +165,30 @@ Prefix is `C-a` (rebindable in `tmux.conf`).
 | `g` / `G`, Home/End | top / bottom |
 | `PgUp` / `PgDn` | page |
 | `Enter` | open the diff popup for the selected file |
+| `?` | open the same help overlay |
 | `r` | force a status refresh |
+
+The git footer is `enter diff · r refresh`; a clean tree says
+`working tree clean` in dim text (never a green banner).
 
 ### Mouse
 
 `mouse on` is required for click-to-focus and border drags. With the tree/git
 pane reporting SGR mouse events:
 
-- click a row to select; click the already-selected row to activate;
-- click a chevron to expand/collapse;
-- right-click opens the pane's own menu;
-- wheel scrolls the pane's list in-app;
+- click a row to select; click the already-selected row to open/activate it;
+- a single-pane tab row activates the tab; a pane row focuses that content pane
+  (the backend calls `internal focus-pane`);
+- click a chevron to expand/collapse a project, task or split tab;
+- right-click opens the pane's own menu; it now includes **Help**;
+- wheel scrolls the pane's list in-app (and the help overlay);
 - **text selection needs `C-a [` (copy-mode)**, or your outer terminal's
   Shift+drag; tmux does not implement a Shift bypass while a pane reports the
   mouse. Wheel in the tree/git is handled by the app, not tmux.
+
+The same help is always one keystroke away: press `?` in the tree or git pane.
+It is an in-pane overlay (not a tmux popup), so it cannot steal focus or leave
+the terminal in a bad state.
 
 ## Restore semantics
 
@@ -185,15 +240,21 @@ editor="${EDITOR:-vi}"    # popup editor for tree e
 default_ref="origin/main" # prefilled “create from”
 default_agent=opencode
 restore_stagger=1         # seconds between agent launches on restore (0 = off)
+theme=auto                # auto|truecolor|256|16
+accent=blue               # blue|cyan|magenta|yellow
 ```
 
 Widths must be 5–200; refresh values 1–3600; `restore_stagger` 0–60.
-`balamba doctor` validates the config. The tmux mirror is:
+`balamba doctor` validates the config. `theme=auto` uses 24-bit when
+`COLORTERM` says truecolor, else 256 colours for a `*-256color` `TERM`, else
+the 16-colour fallback. `accent` changes the single accent used for active rows,
+the selection bar and focus; it does not turn on green. The tmux mirror is:
 
 ```
 @balamba_tree_width   @balamba_git_width  @balamba_active_refresh
 @balamba_idle_refresh @balamba_git_refresh @balamba_editor
-@balamba_default_ref  @balamba_default_agent @balamba_root
+@balamba_default_ref  @balamba_default_agent @balamba_theme
+@balamba_accent       @balamba_root
 ```
 
 Runtime options `@balamba_context` and `@balamba_git_branch` are display values
@@ -301,7 +362,10 @@ panes, 120×40): **≈6% of one core total** (Python UI panes + tmux server) wit
 `active_refresh=1`, `idle_refresh=5`, `git_refresh=2` (`pidstat`, 20 s average;
 approximate, machine-dependent).
 
-- the active window's tree polls every `active_refresh` (1 s);
+- the active window's tree polls every `active_refresh` (1 s) and fires one
+  fire-and-forget `internal sync` per active poll, so a native split appears in
+  about a second; the backend debounces unchanged pane sets, and a failed sync
+  is simply retried next poll;
 - inactive tree panes only check activation every `idle_refresh` (5 s) using
   one `list-windows` call, not one process per window;
 - the git pane polls every `git_refresh` (2 s) only while its window is active;

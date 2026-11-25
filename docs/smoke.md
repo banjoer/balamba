@@ -31,15 +31,24 @@ balamba
 ```
 
 Expect: one window with tree (left), a shell (middle), git (right); the tree
-says `no projects — press p`. No crash. `C-a d` returns to the shell.
+says `no projects` and `press p to add one`, with a dim `? help · p project`
+footer. No crash. `C-a d` returns to the shell.
+
+Focus the tree and press `?`. Expect a bordered in-pane overlay with
+`NAVIGATION`, `SESSIONS`, `MOUSE`, `TMUX` and `DIFF / COPY`, and a
+`? close · j/k scroll` footer. Close it with `?`, `Esc` or `q`; the tree comes
+back and the pane stays alive.
 
 ## 2. Add a project with a space in its path
 
 Press `p`, type the fixture path exactly (`/tmp/.../repo one`), Enter.
 
-Expect: tree shows `repo one`; a shell tab opens in the checkout; the tree is
-about 30 columns and git about 34 (or your configured values); there are three
-columns. Hint: `tmux -L balamba list-panes -t balamba: -F '#{pane_width} #{@balamba_chrome}'`
+Expect: tree shows `repo one` in bold with its dim task count; a shell tab opens
+in the checkout and renders as one row (`› shell 1` plus the live command); the
+tree is about 30 columns and git about 34 (or your configured values); there are
+three columns. Select the project row: the footer reads
+`? help · enter open · n task · t term`. Hint:
+`tmux -L balamba list-panes -t balamba: -F '#{pane_width} #{@balamba_chrome}'`
 should show the tree/git widths.
 
 ## 3. Create a task
@@ -67,21 +76,31 @@ The tab opens with cwd = the worktree; the git pane header shows `fix-login`.
 printf 'changed\n' >>"$(dirname "$tmp/repo one")/balamba_worktrees/repo one/fix-login/README.md"
 ```
 
-Within ~2 seconds the git pane lists ` M README.md`. Press Enter on that row
-(or click it): a popup shows the diff. Quit the pager with `q`. While the
-tree/git reports the mouse, text selection needs `C-a [` (copy-mode) or your
-terminal's Shift+drag.
+Within ~2 seconds the git pane shows a dim `Unstaged 1` section and
+` M README.md` with an amber badge. Press Enter on that row (or click it): a
+popup shows the diff. Quit the pager with `q`. The pane groups files under
+`Staged`, `Unstaged` and `Untracked`, with green `A`, amber `M` and red
+`D`/conflict badges; a clean tree says `working tree clean` in dim text, not a
+green banner. While the tree/git reports the mouse, text selection needs
+`C-a [` (copy-mode) or your terminal's Shift+drag; `?` explains this too.
 
-## 5. Split, tab switching and unread dots
+## 5. Split, pane rows, tab switching and unread dots
 
 In a content pane press `C-a %` (side-by-side split); run `printf 'split\n'`.
+Within about a second the tab in the tree grows a `▾` chevron and a second
+`·` pane row. Click the new pane row (or select it and press Enter): the
+content pane is focused. `h`/`l` on the tab row collapses and expands the pane
+rows.
+
 Create another terminal with `C-a T` → `shell`. In the new tab run
 `sleep 2; printf 'unread\n'`, then immediately switch to the first tab with
 `C-a <tab-number>`.
 
-Expect: a yellow `●` appears on the background tab row (and its task/project
+Expect: an amber `●` appears on the background tab row (and its task/project
 parents) within a couple of seconds. Visiting that tab (`C-a <number>`) clears
-its dot; the parent dot clears when no child tab remains unread.
+its dot; the parent dot clears when no child tab remains unread. A one-pane tab
+stays a single row (glyph, name, optional live command); only split tabs show
+pane rows.
 
 ## 6. Restore after a server kill
 

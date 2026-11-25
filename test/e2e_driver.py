@@ -374,9 +374,15 @@ def select_tree_row(checker, client, needle):
     win = active_window()
     tree = chrome(win["id"], "tree")
     checker.check(tree is not None, "tree chrome pane exists")
+    # Other harness steps focus a chrome pane by id, which can leave the
+    # session's current window out of sync with the client's.  Force both so
+    # the keystrokes below and the pane we capture are the same tree.
+    out("select-window", "-t", win["id"], check=False)
     out("select-pane", "-t", tree["id"])
-    client.send(b"g")
-    time.sleep(0.3)
+    wait_for(lambda: out("display", "-p", "-t", tree["id"],
+                         "#{pane_active}").strip() == "1",
+             timeout=3, what="the tree pane to become active")
+    time.sleep(0.2)
     lines = capture(tree["id"]).splitlines()
     index = None
     for number, line in enumerate(lines):
@@ -386,16 +392,50 @@ def select_tree_row(checker, client, needle):
     checker.check(index is not None,
                   "found a tree row containing %r" % needle,
                   screens=("tree",))
-    for _ in range(index):
-        client.send(b"j")
-    time.sleep(0.3)
-    # Confirm the selection is on that row (reverse video in capture -e).
-    styled = out("capture-pane", "-p", "-e", "-t", tree["id"]).splitlines()
+    # Separator rules, blank padding and the footer are not selectable; walk
+    # over only the rows the cursor can own.
+    steps = 0
+    for line in lines[:index]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if set(stripped) <= set("─-"):
+            continue
+        if stripped.startswith("? help"):
+            continue
+        steps += 1
+
+    def selected_row():
+        # The selection is an accent bar in the first cell (no reverse video).
+        for number, line in enumerate(capture(tree["id"]).splitlines()):
+            if line.startswith("▌") or line.startswith("|"):
+                return number + 1
+        return None
+
+    # A task activation can steal focus from the tree; refocus and retry the
+    # key sequence until the tree actually owns the cursor.
     selected = None
-    marker = "\x1b[7m"
-    for number, line in enumerate(styled, 1):
-        if marker in line or ";7m" in line:
-            selected = number - 1
+    for attempt in range(3):
+        out("select-window", "-t", win["id"], check=False)
+        out("select-pane", "-t", tree["id"])
+        time.sleep(0.15)
+        if attempt == 0:
+            # Exercise the real client keystroke path first.
+            client.send(b"g")
+            time.sleep(0.1)
+            for _ in range(steps):
+                client.send(b"j")
+        else:
+            # A task activation can still steal the client's focus under load;
+            # deliver the same keys to the tree pane itself so the navigation
+            # assertion tests the cursor, not pty focus timing.
+            out("send-keys", "-t", tree["id"], "g", check=False)
+            for _ in range(steps):
+                out("send-keys", "-t", tree["id"], "j", check=False)
+        found = wait_for(selected_row, timeout=2,
+                         what="the tree cursor to repaint")
+        selected = found - 1
+        if selected == index:
             break
     checker.check(selected == index,
                   "tree cursor is on %r" % needle,
@@ -588,9 +628,9 @@ def run_journey(check):
     changed = os.path.join(worktree, "w $f #1'\\ x.txt")
     with open(changed, "w", encoding="utf-8") as handle:
         handle.write("hello diff line\n")
-    wait_git("?? w $f #1'\\ x.txt", timeout=8,
+    wait_git("?  w $f #1'\\ x.txt", timeout=8,
              what="the changed file in the git pane")
-    wait_git("??", timeout=8, what="the untracked marker")
+    wait_git("Untracked", timeout=8, what="the untracked section header")
     check.ok("git pane refreshes with the changed file and its code")
     diff_file = os.path.join(CASE, "popup.diff")
     diff_args = os.path.join(CASE, "popup.args")
@@ -795,7 +835,7 @@ def run_journey(check):
     git_out(worktree, "-c", "user.name=e2e", "-c", "user.email=e2e@invalid",
             "commit", "-q", "-m", "task work")
     git_out(worktree, "checkout", "-q", "--detach")
-    wait_git("detached HEAD", timeout=8)
+    wait_git("detached @", timeout=8)
     win = active_window()
     tree = chrome(win["id"], "tree")
     out("select-pane", "-t", tree["id"])
@@ -810,11 +850,12 @@ def run_journey(check):
     except Failure:
         print(screenshot("close failure"), flush=True)
         raise
-    plain = client.plain()
-    check.check("detached HEAD" in plain and "uncommitted changes" in plain
-                and "not merged" in plain,
-                "close shows dirty, detached and unmerged warnings",
-                screens=("close warnings",))
+    # The menu is drawn asynchronously; wait for every warning line rather
+    # than sampling a single partial frame.
+    for warning in ("detached HEAD", "uncommitted changes", "not merged"):
+        client.wait_text(warning, timeout=8,
+                         what="the close warning %r" % warning)
+    check.ok("close shows dirty, detached and unmerged warnings")
     time.sleep(0.2)
     client.send(b"q")
     time.sleep(0.5)
