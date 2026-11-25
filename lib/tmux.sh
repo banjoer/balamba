@@ -405,7 +405,14 @@ _tmux_equal_layout() {
     y=$((y + ph + 1))
   done
 
-  local rest="${w}x${h},0,0{${tw}x${h},0,0,0,${mw}x${h},$((tw + 1)),0[${body}],${gw}x${h},$((tw + mw + 2)),0,$((n + 1))}"
+  local rest
+  if ((n == 1)); then
+    # A single-child container is accepted by select-layout but tmux 3.4 exits
+    # the server when that child is later killed.  Keep one content pane flat.
+    rest="${w}x${h},0,0{${tw}x${h},0,0,0,${body},${gw}x${h},$((tw + mw + 2)),0,2}"
+  else
+    rest="${w}x${h},0,0{${tw}x${h},0,0,0,${mw}x${h},$((tw + 1)),0[${body}],${gw}x${h},$((tw + mw + 2)),0,$((n + 1))}"
+  fi
   local cs
   cs=$(_tmux_layout_checksum "$rest")
   printf '%s,%s\n' "$cs" "$rest"
@@ -648,6 +655,9 @@ _tmux_set_fill_globals_from_tab() {
   local -a cwds=() launched=()
   local -a pane_json=()
   mapfile -t pane_json < <(jq -c '.panes[]?' <<<"$json")
+  # Restore every saved pane, even if pane_count is stale.  (The geometry
+  # guard still uses the resulting live count.)
+  ((count >= ${#pane_json[@]})) || count=${#pane_json[@]}
   local i pj pcwd plaunched
   for ((i = 0; i < count; i++)); do
     if ((i < ${#pane_json[@]})); then
@@ -932,6 +942,386 @@ _tmux_select_content_pane() {
   return 0
 }
 
+# Short human label for an adopted pane: the live command basename, without
+# arguments.  The live command is already a basename in practice, but a saved
+# value may not be, so normalise anyway.
+_tmux_pane_label() {
+  local cmd=${1-}
+  cmd=${cmd##*/}
+  cmd=${cmd%%[[:space:]]*}
+  cmd=${cmd//[[:space:]]/}
+  [[ -n $cmd ]] || cmd=shell
+  printf '%s\n' "$cmd"
+}
+
+# ---------------------------------------------------------------------------
+# 10.10 tmux_sync_panes [context]
+# ---------------------------------------------------------------------------
+# Materialise the live tmux pane set into state.  Live tmux is the source of
+# truth for each balamba window (identified by @balamba_tab):
+#   * content panes are everything except the @balamba_chrome tree/git panes;
+#   * content index = position in live pane order (live index - 1);
+#   * panes that vanished are dropped, new ones are adopted as "shell";
+#   * window index, pane_count, active_pane and layout are recomputed.
+# Tabs of contexts that have no live window at all are left alone: they are
+# simply not built in this session yet.  A window whose last content pane died
+# is killed and its tab removed.
+#
+# The write is debounced with a fingerprint of the desired pane set in
+# $BALAMBA_RUNTIME/panes.fingerprint, so repeated polls are cheap and do not
+# spam state.json.  Safe and silent when the server is down.
+tmux_sync_panes() {
+  (($# <= 1)) || balamba_die "usage: tmux_sync_panes [proj|task:<task-id>]"
+  local scope=${1-}
+  balamba_config_load >/dev/null 2>&1 || true
+  if [[ ! -f $BALAMBA_STATE ]]; then
+    balamba_state_init || return 2
+  fi
+  _tmux_server_responsive || return 0
+
+  local -A live_idx=() live_win=() live_name=() live_layout=()
+  local -A live_ctx_seen=()
+  local -a live_tabs=()
+  local widx winid wname wctx wpid wtab wlayout
+  while IFS=$'\t' read -r widx winid wname wlayout wtab wctx wpid; do
+    [[ -n $wtab ]] || continue
+    [[ $widx =~ ^[0-9]+$ ]] || continue
+    live_ctx_seen[$wctx]=1
+    if [[ -n $scope && $wctx != "$scope" ]]; then
+      continue
+    fi
+    [[ -n ${live_win[$wtab]+x} ]] && continue
+    live_idx[$wtab]=$widx
+    live_win[$wtab]=$winid
+    live_name[$wtab]=$wname
+    live_layout[$wtab]=$wlayout
+    live_tabs+=("$wtab")
+  done < <(_tmux list-windows -t "$_BALAMBA_TMUX_SESSION" \
+    -F $'#{window_index}\t#{window_id}\t#{window_name}\t#{window_layout}\t#{@balamba_tab}\t#{@balamba_context}\t#{@balamba_project}' \
+    2>/dev/null || true)
+
+  # State tabs, keyed by id (with their context and current window).
+  local -A state_tab=() state_ctx=() state_win=()
+  local -a state_tabs=()
+  local b64 obj stid sctx swin
+  while IFS= read -r b64; do
+    [[ -n $b64 ]] || continue
+    obj=$(_tmux_state_b64_decode "$b64")
+    [[ -n $obj ]] || continue
+    stid=$(jq -r '.tab.id // ""' <<<"$obj")
+    [[ -n $stid ]] || continue
+    sctx=$(jq -r '.context // "proj"' <<<"$obj")
+    swin=$(jq -r '.tab.window // 0' <<<"$obj")
+    state_tab[$stid]=$obj
+    state_ctx[$stid]=$sctx
+    state_win[$stid]=$swin
+    state_tabs+=("$stid")
+  done < <(_tmux_all_tabs_b64)
+
+  local -a entries=() removed=()
+  local -A remove_win=() live_ids=()
+  local tabid
+  for tabid in "${live_tabs[@]}"; do
+    obj=${state_tab[$tabid]-}
+    # A window tagged with an unknown tab id is not ours to adopt.
+    [[ -n $obj ]] || continue
+    live_ids[$tabid]=1
+    winid=${live_win[$tabid]}
+    obj=$(jq -c '.tab' <<<"$obj")
+
+    local -a pane_rows=()
+    local prow pidx pid chrome pactive pcwd pcmd pdead
+    mapfile -t pane_rows < <(_tmux list-panes -t "$winid" \
+      -F $'#{pane_index}\t#{pane_id}\t#{pane_active}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_dead}\t#{@balamba_chrome}' \
+      2>/dev/null | sort -t $'\t' -k1,1n)
+
+    local -a p_cwd=() p_cmd=() p_active=()
+    local count=0
+    for prow in "${pane_rows[@]}"; do
+      IFS=$'\t' read -r pidx pid pactive pcwd pcmd pdead chrome <<<"$prow"
+      [[ $chrome == tree || $chrome == git ]] && continue
+      p_cwd[$count]=$pcwd
+      p_cmd[$count]=$pcmd
+      p_active[$count]=$pactive
+      count=$((count + 1))
+    done
+
+    if ((count == 0)); then
+      # No content pane left: the tab is dead even though chrome remains.
+      _tmux kill-window -t "$winid" >/dev/null 2>&1 || true
+      removed+=("$tabid")
+      remove_win[$tabid]=${state_win[$tabid]-0}
+      continue
+    fi
+
+    local -a old_rows=()
+    mapfile -t old_rows < <(jq -r \
+      '.panes[]? | [(.launched // ""), (.name // ""), (.cwd // ""), (.live_command // "")] | join("\u001f")' \
+      <<<"$obj")
+    local old_n=${#old_rows[@]}
+    local -a old_launched=() old_name=() old_cwd=() old_cmd=()
+    local i orow ol on oc ocmd
+    for ((i = 0; i < old_n; i++)); do
+      orow=${old_rows[$i]}
+      IFS=$'\x1f' read -r ol on oc ocmd <<<"$orow"
+      old_launched[$i]=$ol
+      old_name[$i]=$on
+      old_cwd[$i]=$oc
+      old_cmd[$i]=$ocmd
+    done
+
+    local old_active
+    old_active=$(jq -r '.active_pane // 0' <<<"$obj")
+    [[ $old_active =~ ^[0-9]+$ ]] || old_active=0
+    local old_tab_name
+    old_tab_name=$(jq -r '.name // ""' <<<"$obj")
+
+    # Reserve the names of panes that survive this index so adopted panes get
+    # a numeric suffix instead of colliding.
+    local -A used=()
+    for ((i = 0; i < count && i < old_n; i++)); do
+      [[ -n ${old_name[$i]} ]] && used[${old_name[$i]}]=1
+    done
+
+    local -a pane_objs=()
+    local active_index="" launched name cwd cmd active n base
+    for ((i = 0; i < count; i++)); do
+      launched=shell
+      name=""
+      if ((i < old_n)); then
+        if [[ ${old_launched[$i]} == agent || ${old_launched[$i]} == shell ]]; then
+          launched=${old_launched[$i]}
+        fi
+        name=${old_name[$i]}
+      fi
+      cwd=${p_cwd[$i]-}
+      [[ -n $cwd ]] || cwd=${old_cwd[$i]-}
+      [[ -n $cwd ]] || cwd=$HOME
+      cmd=${p_cmd[$i]-}
+      [[ -n $cmd ]] || cmd=${old_cmd[$i]-}
+      active=false
+      [[ ${p_active[$i]-0} == 1 ]] && active=true
+      [[ $active == true ]] && active_index=$i
+
+      if [[ -z $name ]]; then
+        base=$(_tmux_pane_label "$cmd")
+        name=$base
+        n=2
+        while [[ -n ${used[$name]+x} ]]; do
+          name="$base $n"
+          n=$((n + 1))
+        done
+        used[$name]=1
+      fi
+
+      pane_objs+=("$(jq -nc \
+        --argjson index "$i" --arg cwd "$cwd" --arg launched "$launched" \
+        --arg name "$name" --arg live_command "$cmd" --argjson active "$active" \
+        '{index:$index,cwd:$cwd,launched:$launched,name:$name,
+          live_command:$live_command,active:$active}')")
+    done
+
+    local active_pane=$old_active
+    [[ -n $active_index ]] && active_pane=$active_index
+    ((active_pane < count)) || active_pane=$((count - 1))
+    ((active_pane >= 0)) || active_pane=0
+
+    local panes_json new_name new_layout
+    panes_json=$(printf '%s\n' "${pane_objs[@]}" | jq -s -c '.')
+    new_name=${live_name[$tabid]}
+    [[ -n $new_name ]] || new_name=$old_tab_name
+    new_layout=${live_layout[$tabid]}
+    [[ -n $new_layout ]] || new_layout=$(jq -r '.layout // ""' <<<"$obj")
+
+    entries+=("$(jq -nc \
+      --arg id "$tabid" --arg name "$new_name" --arg layout "$new_layout" \
+      --argjson window "${live_idx[$tabid]}" \
+      --argjson pane_count "$count" --argjson active_pane "$active_pane" \
+      --argjson panes "$panes_json" \
+      '{id:$id,name:$name,window:$window,pane_count:$pane_count,
+        layout:$layout,active_pane:$active_pane,panes:$panes}')")
+  done
+
+  # Tabs of a context that is live in this session but whose window vanished
+  # were closed by the user (or by the zero-content rule above): drop them.
+  for stid in "${state_tabs[@]}"; do
+    [[ -n ${live_ids[$stid]+x} ]] && continue
+    [[ -n $scope && ${state_ctx[$stid]} != "$scope" ]] && continue
+    [[ -n ${live_ctx_seen[${state_ctx[$stid]}]+x} ]] || continue
+    removed+=("$stid")
+    remove_win[$stid]=${state_win[$stid]-0}
+  done
+
+  ((${#entries[@]} || ${#removed[@]})) || return 0
+
+  local entries_json removed_json
+  if ((${#entries[@]})); then
+    entries_json=$(printf '%s\n' "${entries[@]}" | jq -s -c 'sort_by(.id)')
+  else
+    entries_json='[]'
+  fi
+  if ((${#removed[@]})); then
+    removed_json=$(printf '%s\n' "${removed[@]}" | jq -R . | jq -s -c 'unique')
+  else
+    removed_json='[]'
+  fi
+
+  local fingerprint payload fp fpfile
+  payload=$(jq -nc --arg scope "$scope" \
+    --argjson entries "$entries_json" --argjson removed "$removed_json" \
+    '{scope:$scope,entries:$entries,removed:$removed}')
+  fp=$(printf '%s' "$payload" | cksum | tr -d ' \n')
+  fpfile="$BALAMBA_RUNTIME/panes.fingerprint"
+  if [[ -s $fpfile && -f $BALAMBA_STATE && $(<"$fpfile") == "$fp" ]]; then
+    return 0
+  fi
+
+  local entries_map
+  entries_map=$(jq -nc --argjson e "$entries_json" \
+    '$e | map({key:.id,value:.}) | from_entries')
+
+  balamba_state_update '
+    def upd:
+      . as $t
+      | ($m[$t.id] // null) as $v
+      | if $v == null then $t
+        else $t
+          | .window = $v.window
+          | .name = (if $v.name == "" then $t.name else $v.name end)
+          | .pane_count = $v.pane_count
+          | .layout = (if $v.layout == "" then $t.layout else $v.layout end)
+          | .active_pane = $v.active_pane
+          | .panes = $v.panes
+        end;
+    .projects |= map(
+      .tabs |= (map(upd) | map(select(.id as $i | $removed | index($i) | not)) | sort_by(.window))
+      | .tasks |= map(
+          .tabs |= (map(upd) | map(select(.id as $i | $removed | index($i) | not)) | sort_by(.window))))
+  ' --argjson m "$entries_map" --argjson removed "$removed_json"
+
+  mkdir -p -- "$BALAMBA_RUNTIME" 2>/dev/null || true
+  printf '%s\n' "$fp" >"$fpfile" 2>/dev/null || true
+
+  # If the active window was one of the removed ones, follow the first
+  # surviving tab of the active context instead of leaving a dangling index.
+  local apid actx awin first_win was_removed=0 r
+  apid=$(balamba_state_get '.active.project // empty')
+  actx=$(balamba_state_get '.active.context // empty')
+  awin=$(balamba_state_get '.active.window // 0')
+  if [[ -n $apid && -n $actx && -n $awin ]]; then
+    for r in "${!remove_win[@]}"; do
+      [[ ${remove_win[$r]} == "$awin" ]] && was_removed=1
+    done
+    if ((was_removed)); then
+      if [[ $actx == proj ]]; then
+        first_win=$(balamba_state_get '
+          .projects[] | select(.id==$p) | .tabs | sort_by(.window) | .[0].window // empty
+        ' --arg p "$apid" 2>/dev/null || true)
+      else
+        first_win=$(balamba_state_get '
+          .projects[] | select(.id==$p) | .tasks[] | select(.id==$t)
+          | .tabs | sort_by(.window) | .[0].window // empty
+        ' --arg p "$apid" --arg t "${actx#task:}" 2>/dev/null || true)
+      fi
+      if [[ $first_win =~ ^[0-9]+$ ]]; then
+        balamba_state_update '.active.window = $w' --argjson w "$first_win" \
+          >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 10.11 tmux_activate_pane
+# ---------------------------------------------------------------------------
+# Focus one content pane of a tab.  Content indices are 0-based; live tmux
+# index = content index + 1 (tree chrome is live 0).
+tmux_activate_pane() {
+  (($# == 4)) || \
+    balamba_die "usage: tmux_activate_pane <project-id> <context> <tab-id> <pane-index>"
+  local pid=$1 context=$2 tab=$3 index=$4
+  if [[ ! $index =~ ^[0-9]+$ ]]; then
+    balamba_warn "pane index must be a non-negative integer (got '$index')"
+    return 2
+  fi
+  balamba_config_load || balamba_die "could not load config: $BALAMBA_CONFIG"
+  balamba_state_init
+  _tmux_resolve_context "$pid" "$context"
+  tmux_server_up
+
+  local n
+  n=$(balamba_state_get '
+    .projects[] | select(.id == $p)
+    | (if $c == "proj" then .tabs else (.tasks[] | select(.id == $t) | .tabs) end)
+    | map(select(.id == $tab)) | length
+  ' --arg p "$pid" --arg c "$context" --arg t "${context#task:}" \
+    --arg tab "$tab" 2>/dev/null || printf '0')
+  [[ $n =~ ^[0-9]+$ ]] || n=0
+  if ((n == 0)); then
+    balamba_die "unknown tab: $tab (context $context of project $pid)"
+  fi
+
+  local winidx
+  if ! winidx=$(_tmux_window_index_for_tab "$tab"); then
+    local _prev_allow=$_TMUX_ALLOW_MISSING_PATH
+    _TMUX_ALLOW_MISSING_PATH=1
+    _tmux_build_context_windows "$pid" "$context" >/dev/null 2>&1 || true
+    _TMUX_ALLOW_MISSING_PATH=$_prev_allow
+    winidx=$(_tmux_window_index_for_tab "$tab" || true)
+  fi
+  if [[ -z $winidx ]]; then
+    balamba_warn "tab $tab has no live window in $context"
+    return 2
+  fi
+
+  local winid
+  winid=$(_tmux display -p -t "$_BALAMBA_TMUX_SESSION:$winidx" '#{window_id}' \
+    2>/dev/null || true)
+  [[ -n $winid ]] || {
+    balamba_warn "tab $tab has no live window in $context"
+    return 2
+  }
+
+  _tmux_show_window "$winidx"
+  _tmux_set_global_context "$pid" "$context" "$_TMUX_CTX_BRANCH"
+  balamba_state_update '
+    .active.project = $p | .active.context = $c | .active.window = $w
+  ' --arg p "$pid" --arg c "$context" --argjson w "$winidx"
+
+  tmux_assert_widths "$winid" >/dev/null 2>&1 || true
+
+  local -a ids=()
+  mapfile -t ids < <(_tmux_content_pane_ids "$winid")
+  if ((index >= ${#ids[@]})); then
+    # The pane may have been closed between the click and this call.
+    tmux_sync_panes "$context" >/dev/null 2>&1 || true
+    mapfile -t ids < <(_tmux_content_pane_ids "$winid")
+  fi
+  if ((index >= ${#ids[@]})); then
+    balamba_warn "pane $index no longer exists in tab $tab ($context); state was re-synced"
+    return 2
+  fi
+
+  if ! _tmux select-pane -t "${ids[$index]}" >/dev/null 2>&1; then
+    balamba_warn "could not select pane $index in tab $tab ($context)"
+    return 2
+  fi
+
+  balamba_state_update '
+    .projects |= map(
+      .tabs |= map(if .id == $tab then
+        .active_pane = $i | .panes |= map(.active = (.index == $i))
+        else . end)
+      | .tasks |= map(.tabs |= map(if .id == $tab then
+          .active_pane = $i | .panes |= map(.active = (.index == $i))
+          else . end)))
+  ' --arg tab "$tab" --argjson i "$index" >/dev/null 2>&1 || true
+
+  tmux_assert_widths "$winid" >/dev/null 2>&1 || true
+  return 0
+}
+
 # Make a window visible: switch the current client when possible, otherwise
 # select it in the session.
 _tmux_show_window() {
@@ -1114,22 +1504,26 @@ _tmux_create_tab() {
   final_index=$(_tmux display -p -t "$win" '#{window_index}' 2>/dev/null || printf '0')
   layout=$(_tmux display -p -t "$win" '#{window_layout}' 2>/dev/null || true)
 
-  local tab_json
+  local tab_json pane_name
   if [[ $kind == agent ]]; then
+    pane_name=${label:-$agent}
     tab_json=$(jq -nc \
       --arg id "$tab_id" --arg name "$name" --arg agent "$agent" \
       --arg session "$session" --argjson window "$final_index" \
-      --arg layout "$layout" --arg cwd "$cwd" \
+      --arg layout "$layout" --arg cwd "$cwd" --arg pname "$pane_name" \
       '{id:$id,name:$name,kind:"agent",agent:$agent,session:$session,
         window:$window,pane_count:1,layout:$layout,active_pane:0,
-        panes:[{index:0,cwd:$cwd,launched:"agent"}]}')
+        panes:[{index:0,cwd:$cwd,launched:"agent",name:$pname,
+                live_command:"",active:true}]}')
   else
+    pane_name=$(_tmux_pane_label "${SHELL:-/bin/sh}")
     tab_json=$(jq -nc \
       --arg id "$tab_id" --arg name "$name" --argjson window "$final_index" \
-      --arg layout "$layout" --arg cwd "$cwd" \
+      --arg layout "$layout" --arg cwd "$cwd" --arg pname "$pane_name" \
       '{id:$id,name:$name,kind:"shell",agent:null,session:null,
         window:$window,pane_count:1,layout:$layout,active_pane:0,
-        panes:[{index:0,cwd:$cwd,launched:"shell"}]}')
+        panes:[{index:0,cwd:$cwd,launched:"shell",name:$pname,
+                live_command:"",active:true}]}')
   fi
 
   if [[ $context == proj ]]; then
@@ -1503,77 +1897,20 @@ tmux_save_runtime() {
   balamba_state_init
   _tmux_session_exists || return 0
 
+  # One reconciliation path for manual splits, adopted panes and closed
+  # windows.  It is debounced internally, so calling save on detach/poll is
+  # cheap when nothing changed.
+  tmux_sync_panes || return 2
+
   local -a win_rows=()
   local row widx winid wname wtab wctx
   mapfile -t win_rows < <(_tmux list-windows -t "$_BALAMBA_TMUX_SESSION" \
     -F $'#{window_index}\t#{window_id}\t#{window_name}\t#{@balamba_context}\t#{@balamba_tab}' \
     2>/dev/null || true)
 
-  local -a entries=()
-  local entry
-  local current_index=""
-  for row in "${win_rows[@]}"; do
-    IFS=$'\t' read -r widx winid wname wctx wtab <<<"$row"
-    [[ -n $wtab ]] || continue
-    [[ $widx =~ ^[0-9]+$ ]] || continue
-
-    local -a pane_rows=()
-    local prow pidx ppane pactive pcwd pchrome
-    mapfile -t pane_rows < <(_tmux list-panes -t "$winid" \
-      -F $'#{pane_index}\t#{pane_id}\t#{pane_active}\t#{pane_current_path}\t#{@balamba_chrome}' \
-      2>/dev/null | sort -t $'\t' -k1,1n)
-
-    local -a cwds=()
-    local content_count=0 active_pane="null" active_seen=0
-    for prow in "${pane_rows[@]}"; do
-      IFS=$'\t' read -r pidx ppane pactive pcwd pchrome <<<"$prow"
-      [[ $pchrome == tree || $pchrome == git ]] && continue
-      if [[ $pactive == 1 ]]; then
-        active_pane=$content_count
-        active_seen=1
-      fi
-      cwds+=("$pcwd")
-      content_count=$((content_count + 1))
-    done
-    if ((content_count == 0)); then
-      # Keep the tab valid even if the user killed every content pane.
-      cwds+=("$HOME")
-      content_count=1
-    fi
-    if ((!active_seen)); then
-      active_pane="null"
-    fi
-
-    local cwds_json layout
-    if ((${#cwds[@]})); then
-      cwds_json=$(printf '%s\n' "${cwds[@]}" | jq -R . | jq -s .)
-    else
-      cwds_json='[]'
-    fi
-    layout=$(_tmux display -p -t "$winid" '#{window_layout}' 2>/dev/null || true)
-    if [[ -z $layout ]]; then
-      layout=$(balamba_state_get '
-        .projects[] as $p
-        | (($p.tabs[]?, ($p.tasks[]? | .tabs[]?)) | select(.id == $t) | .layout)[0] // ""
-      ' --arg t "$wtab" 2>/dev/null || true)
-    fi
-
-    entry=$(jq -nc \
-      --arg id "$wtab" --arg name "$wname" --arg layout "$layout" \
-      --argjson window "$widx" --argjson pane_count "$content_count" \
-      --argjson active_pane "$active_pane" --argjson cwds "$cwds_json" \
-      '{id:$id,name:$name,window:$window,pane_count:$pane_count,
-        layout:$layout,active_pane:$active_pane,cwds:$cwds}')
-    entries+=("$entry")
-  done
-
-  ((${#entries[@]})) || return 0
-
-  local map
-  map=$(printf '%s\n' "${entries[@]}" | jq -s 'map({key:.id,value:.}) | from_entries')
-
   # Current window: our own pane when inside a pane, else the session's
   # current window (set by select-window even while detached).
+  local current_index=""
   if [[ -n ${TMUX_PANE:-} ]]; then
     current_index=$(_tmux display -p -t "$TMUX_PANE" '#{window_index}' 2>/dev/null || true)
   fi
@@ -1605,32 +1942,13 @@ tmux_save_runtime() {
     fi
   fi
 
-  balamba_state_update '
-    def upd:
-      . as $t
-      | ($m[$t.id] // null) as $v
-      | if $v == null then $t
-        else $t
-          | .window = $v.window
-          | .name = $v.name
-          | .pane_count = $v.pane_count
-          | .layout = $v.layout
-          | .active_pane = ($v.active_pane // $t.active_pane)
-          | .panes = [range(0; $v.pane_count) as $i
-              | {index:$i,
-                 cwd:($v.cwds[$i] // $t.panes[$i].cwd // ""),
-                 launched:(($t.panes[$i].launched?) //
-                   (if $t.kind == "agent" and $i == 0 then "agent" else "shell" end))}]
-        end;
-    .projects |= map(
-      .tabs |= map(upd)
-      | .tasks |= map(.tabs |= map(upd)))
-    | if $active != null then
-        .active.project = $active.project
-        | .active.context = $active.context
-        | .active.window = $active.window
-      else . end
-  ' --argjson m "$map" --argjson active "$active_json"
+  if [[ $active_json != null ]]; then
+    balamba_state_update '
+      .active.project = $active.project
+      | .active.context = $active.context
+      | .active.window = $active.window
+    ' --argjson active "$active_json"
+  fi
   return 0
 }
 

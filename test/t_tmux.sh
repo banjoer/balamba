@@ -202,6 +202,24 @@ tab_field() {
   " --arg t "$tab"
 }
 
+pane_field() {
+  local tab=$1 index=$2 field=$3
+  balamba_state_get "
+    .projects[] as \$p
+    | (\$p.tabs[]?, (\$p.tasks[]? | .tabs[]?))
+    | select(.id == \$t) | .panes[\$i].$field
+  " --arg t "$tab" --argjson i "$index"
+}
+
+pane_length() {
+  local tab=$1
+  balamba_state_get "
+    .projects[] as \$p
+    | (\$p.tabs[]?, (\$p.tasks[]? | .tabs[]?))
+    | select(.id == \$t) | (.panes | length)
+  " --arg t "$tab"
+}
+
 tabs_of() {
   local pid=$1 context=$2 tid=${2#task:} n
   if [[ $context == proj ]]; then
@@ -607,5 +625,242 @@ assert_eq "$tasks_before" "1" "reconcile: exactly one task existed before"
 assert_eq "1" "$(balamba_state_get '[.projects[] | .tabs[]?] | length')" \
   "reconcile: project tabs are still in state"
 assert_eq "1" "$(window_count)" "reconcile: the rest of the workspace restored"
+
+# ---------------------------------------------------------------------------
+# Sync: native split becomes a first-class content pane in state
+# ---------------------------------------------------------------------------
+reset_all
+add_project p_alpha "$ALPHA" alpha
+tmux_ensure_session
+sync_tab=$(tsess list-windows -t balamba -F '#{@balamba_tab}' | head -n1)
+sync_win=$(window_id_for_tab "$sync_tab")
+sync_c0=$(content_ids "$sync_win" | head -n1)
+tsess split-window -h -t "$sync_c0" -c "$OTHER_CWD" 'sleep 900' >/dev/null 2>&1
+sync_p1=$(content_ids "$sync_win" | tail -n1)
+tsess select-pane -t "$sync_p1" >/dev/null 2>&1
+wait_until bash -c "[[ \$(tmux -L '$BALAMBA_SOCKET' display -p -t '$sync_p1' '#{pane_current_command}') == sleep ]]"
+assert_status 0 "sync: reconciles a native split" tmux_sync_panes
+assert_eq "2" "$(tab_field "$sync_tab" pane_count)" "sync: pane_count counts content only"
+assert_eq "2" "$(pane_length "$sync_tab")" "sync: panes array matches live content"
+assert_eq "0" "$(pane_field "$sync_tab" 0 index)" "sync: pane 0 index is content-relative"
+assert_eq "1" "$(pane_field "$sync_tab" 1 index)" "sync: adopted pane gets index 1"
+assert_eq "$ALPHA" "$(pane_field "$sync_tab" 0 cwd)" "sync: first pane cwd captured"
+assert_eq "$OTHER_CWD" "$(pane_field "$sync_tab" 1 cwd)" "sync: adopted cwd captured (spaces preserved)"
+assert_eq "sleep" "$(pane_field "$sync_tab" 1 live_command)" "sync: live command captured"
+assert_eq "sleep" "$(pane_field "$sync_tab" 1 name)" "sync: adopted pane named from the live command"
+assert_ne "" "$(pane_field "$sync_tab" 0 live_command)" "sync: existing pane live command captured"
+assert_eq "true" "$(pane_field "$sync_tab" 1 active)" "sync: active flag stored"
+assert_eq "false" "$(pane_field "$sync_tab" 0 active)" "sync: inactive flag stored"
+assert_eq "1" "$(tab_field "$sync_tab" active_pane)" "sync: active_pane is content-relative"
+assert_eq "$(tsess display -p -t "$sync_win" '#{window_layout}')" \
+  "$(tab_field "$sync_tab" layout)" "sync: layout updated from the live window"
+assert_eq "0" "$(tab_field "$sync_tab" window)" "sync: window index kept"
+
+# Idempotence: the fingerprint suppresses the second write.
+assert_status 0 "sync: second run succeeds" tmux_sync_panes
+before_state=$(jq -S . "$BALAMBA_STATE")
+assert_status 0 "sync: third run succeeds" tmux_sync_panes
+assert_eq "$before_state" "$(jq -S . "$BALAMBA_STATE")" \
+  "sync: fingerprint makes a no-change sync write nothing"
+assert_status 0 "sync: state still validates" balamba_state_validate
+[[ -s "$BALAMBA_RUNTIME/panes.fingerprint" ]] && \
+  _pass "sync: fingerprint file is written" || \
+  _fail "sync: fingerprint file is written" "missing $BALAMBA_RUNTIME/panes.fingerprint"
+
+# ---------------------------------------------------------------------------
+# Sync: kill the middle of three panes, indices renumber
+# ---------------------------------------------------------------------------
+reset_all
+add_project p_alpha "$ALPHA" alpha
+tmux_ensure_session
+kill_tab=$(tsess list-windows -t balamba -F '#{@balamba_tab}' | head -n1)
+kill_win=$(window_id_for_tab "$kill_tab")
+kill_c0=$(content_ids "$kill_win" | head -n1)
+THIRD_CWD="$CASE_ROOT/third cwd"
+mkdir -p -- "$THIRD_CWD"
+tsess split-window -h -t "$kill_c0" -c "$OTHER_CWD" 'sleep 900' >/dev/null 2>&1
+kill_mid=$(content_ids "$kill_win" | sed -n '2p')
+tsess split-window -h -t "$kill_mid" -c "$THIRD_CWD" 'sleep 900' >/dev/null 2>&1
+assert_eq "3" "$(content_count "$kill_win")" "sync: three content panes before the kill"
+tsess kill-pane -t "$kill_mid" >/dev/null 2>&1
+assert_eq "2" "$(content_count "$kill_win")" "sync: two content panes after the kill"
+tsess select-pane -t "$(content_ids "$kill_win" | tail -n1)" >/dev/null 2>&1
+assert_status 0 "sync: renumbers after a middle pane dies" tmux_sync_panes
+assert_eq "2" "$(tab_field "$kill_tab" pane_count)" "sync: pane_count after the kill"
+assert_eq "2" "$(pane_length "$kill_tab")" "sync: panes array after the kill"
+assert_eq "0" "$(pane_field "$kill_tab" 0 index)" "sync: surviving first pane keeps index 0"
+assert_eq "1" "$(pane_field "$kill_tab" 1 index)" "sync: former third pane renumbers to 1"
+assert_eq "$ALPHA" "$(pane_field "$kill_tab" 0 cwd)" "sync: first cwd after the kill"
+assert_eq "$THIRD_CWD" "$(pane_field "$kill_tab" 1 cwd)" "sync: former third cwd after the kill"
+assert_eq "$(tsess display -p -t "$kill_win" '#{window_layout}')" \
+  "$(tab_field "$kill_tab" layout)" "sync: layout follows the renumbered panes"
+
+# ---------------------------------------------------------------------------
+# Sync: agent identity survives; a command named opencode is not a session
+# ---------------------------------------------------------------------------
+reset_all
+add_project p_alpha "$ALPHA" alpha
+tmux_ensure_session
+capture tmux_open_tab p_alpha proj agent
+id_tab=$CAP_OUT
+id_session=$(tab_field "$id_tab" session)
+assert_match '^ses_[0-9a-f]{32}$' "$id_session" "identity: agent tab starts with a session"
+id_win=$(window_id_for_tab "$id_tab")
+id_c0=$(content_ids "$id_win" | head -n1)
+tsess split-window -h -t "$id_c0" -c "$OTHER_CWD" \
+  "bash -c 'exec -a opencode sleep 900'" >/dev/null 2>&1
+wait_until bash -c "[[ \$(tmux -L '$BALAMBA_SOCKET' list-panes -t '$id_win' -F '#{pane_current_command}' | grep -cx opencode) -eq 1 ]]"
+assert_status 0 "identity: syncs agent and adopted panes" tmux_sync_panes
+assert_eq "agent" "$(pane_field "$id_tab" 0 launched)" "identity: tracked agent pane stays agent"
+assert_eq "fake" "$(pane_field "$id_tab" 0 name)" "identity: tracked agent pane is never renamed"
+assert_eq "$id_session" "$(tab_field "$id_tab" session)" "identity: tab session is unchanged"
+assert_eq "fakeagent" "$(tab_field "$id_tab" agent)" "identity: tab agent is unchanged"
+assert_eq "sleep" "$(pane_field "$id_tab" 0 live_command)" \
+  "identity: tracked agent records its live command"
+assert_eq "shell" "$(pane_field "$id_tab" 1 launched)" \
+  "identity: an adopted opencode command stays a shell pane"
+assert_eq "opencode" "$(pane_field "$id_tab" 1 live_command)" \
+  "identity: adopted opencode records live_command only"
+assert_eq "opencode" "$(pane_field "$id_tab" 1 name)" \
+  "identity: adopted opencode gets a command-derived name"
+assert_eq "$id_session" "$(tab_field "$id_tab" session)" \
+  "identity: adoption never invents a session id"
+
+# ---------------------------------------------------------------------------
+# Focus a specific content pane
+# ---------------------------------------------------------------------------
+reset_all
+add_project p_alpha "$ALPHA" alpha
+tmux_ensure_session
+focus_tab=$(tsess list-windows -t balamba -F '#{@balamba_tab}' | head -n1)
+focus_win=$(window_id_for_tab "$focus_tab")
+focus_c0=$(content_ids "$focus_win" | head -n1)
+tsess split-window -h -t "$focus_c0" -c "$OTHER_CWD" 'sleep 900' >/dev/null 2>&1
+tmux_sync_panes
+assert_status 0 "focus-pane: selects a content pane" \
+  tmux_activate_pane p_alpha proj "$focus_tab" 1
+assert_eq "1" "$(active_content_index "$focus_win")" "focus-pane: live pane 1 is active"
+assert_eq "1" "$(tab_field "$focus_tab" active_pane)" "focus-pane: active_pane updated in state"
+assert_eq "true" "$(pane_field "$focus_tab" 1 active)" "focus-pane: pane active flag updated"
+assert_eq "0" "$(tab_field "$focus_tab" window)" "focus-pane: state keeps the window index"
+assert_status 0 "focus-pane: pane 0 still works" \
+  tmux_activate_pane p_alpha proj "$focus_tab" 0
+assert_eq "0" "$(active_content_index "$focus_win")" "focus-pane: live pane 0 is active"
+
+capture tmux_activate_pane p_alpha proj "$focus_tab" 9
+assert_eq "2" "$CAP_RC" "focus-pane: a missing pane index fails"
+assert_contains "$CAP_ERR" "pane 9 no longer exists" \
+  "focus-pane: the error names the missing pane"
+assert_eq "2" "$(tab_field "$focus_tab" pane_count)" \
+  "focus-pane: a missing pane triggers a re-sync, not corruption"
+
+# ---------------------------------------------------------------------------
+# Restore: every content pane comes back, agent resumes with its session
+# ---------------------------------------------------------------------------
+reset_all
+add_project p_alpha "$ALPHA" alpha
+tmux_ensure_session
+restore_tab=$(tsess list-windows -t balamba -F '#{@balamba_tab}' | head -n1)
+restore_win=$(window_id_for_tab "$restore_tab")
+restore_c0=$(content_ids "$restore_win" | head -n1)
+RCWD1="$CASE_ROOT/restore one"
+RCWD2="$CASE_ROOT/restore two"
+mkdir -p -- "$RCWD1" "$RCWD2"
+tsess split-window -h -t "$restore_c0" -c "$RCWD1" 'sleep 900' >/dev/null 2>&1
+restore_p1=$(content_ids "$restore_win" | sed -n '2p')
+tsess split-window -h -t "$restore_p1" -c "$RCWD2" 'sleep 900' >/dev/null 2>&1
+restore_p2=$(content_ids "$restore_win" | tail -n1)
+tsess resize-pane -t "$restore_p2" -x 60 >/dev/null 2>&1
+tsess select-pane -t "$restore_p1" >/dev/null 2>&1
+assert_eq "3" "$(content_count "$restore_win")" "restore-all: three content panes before save"
+
+capture tmux_open_tab p_alpha proj agent
+restore_agent=$CAP_OUT
+restore_agent_session=$(tab_field "$restore_agent" session)
+agent_lines_before_all=$(wc -l <"$AGENT_LOG" | tr -d ' ')
+
+assert_status 0 "restore-all: save captures the manual splits" tmux_save_runtime
+assert_eq "3" "$(tab_field "$restore_tab" pane_count)" "restore-all: all panes saved"
+restore_geom=$(content_geometry_list "$restore_win")
+restore_cwds=$(content_cwds_joined "$restore_win" | tr '\n' ';')
+assert_contains "$restore_cwds" "$RCWD1" "restore-all: middle cwd saved"
+assert_contains "$restore_cwds" "$RCWD2" "restore-all: last cwd saved"
+
+tsess kill-server >/dev/null 2>&1 || true
+for _i in $(seq 1 100); do
+  tsess has-session -t balamba >/dev/null 2>&1 || break
+  sleep 0.02
+done
+assert_status 0 "restore-all: rebuilds from state" tmux_restore
+restore_win2=$(window_id_for_tab "$restore_tab")
+assert_eq "3" "$(content_count "$restore_win2")" "restore-all: three content panes restored"
+for _i in $(seq 1 100); do
+  [[ "$(content_cwds_joined "$restore_win2" | tr '\n' ';')" == "$restore_cwds" ]] && break
+  sleep 0.03
+done
+assert_eq "$restore_cwds" "$(content_cwds_joined "$restore_win2" | tr '\n' ';')" \
+  "restore-all: content order and cwds restored"
+assert_eq "$restore_geom" "$(content_geometry_list "$restore_win2")" \
+  "restore-all: split geometry restored"
+assert_eq "1" "$(active_content_index "$restore_win2")" \
+  "restore-all: saved active pane restored"
+
+if wait_log_lines $((agent_lines_before_all + 2)); then
+  _pass "restore-all: agent pane resumes"
+else
+  _fail "restore-all: agent pane resumes" "agent log did not grow"
+fi
+assert_contains "$(sed -n "$((agent_lines_before_all + 2))p" "$AGENT_LOG")" \
+  "--session $restore_agent_session" "restore-all: agent keeps its --session args"
+
+# ---------------------------------------------------------------------------
+# Sync: the last content pane dies, so the tab/window disappears
+# ---------------------------------------------------------------------------
+reset_all
+add_project p_alpha "$ALPHA" alpha
+tmux_ensure_session
+dead_tab=$(tsess list-windows -t balamba -F '#{@balamba_tab}' | head -n1)
+capture tmux_open_tab p_alpha proj shell
+dead_other=$CAP_OUT
+dead_win=$(window_id_for_tab "$dead_tab")
+dead_c0=$(content_ids "$dead_win" | head -n1)
+tsess kill-pane -t "$dead_c0" >/dev/null 2>&1
+assert_eq "0" "$(content_count "$dead_win")" "dead-last: the window has chrome only"
+assert_status 0 "dead-last: sync handles it" tmux_sync_panes
+assert_eq "1" "$(tabs_of p_alpha proj)" "dead-last: only the surviving tab is in state"
+assert_eq "0" "$(balamba_state_get '
+  [.projects[] | select(.id == $p) | .tabs[] | select(.id == $t)] | length
+' --arg p p_alpha --arg t "$dead_tab")" "dead-last: dead tab removed from state"
+assert_eq "1" "$(balamba_state_get '
+  [.projects[] | select(.id == $p) | .tabs[] | select(.id == $t)] | length
+' --arg p p_alpha --arg t "$dead_other")" "dead-last: surviving tab stays in state"
+if window_for_tab "$dead_tab" >/dev/null 2>&1; then
+  _fail "dead-last: window is gone" "window for $dead_tab still exists"
+else
+  _pass "dead-last: window is gone"
+fi
+assert_eq "1" "$(pane_length "$dead_other")" "dead-last: no dangling pane entries"
+
+# ---------------------------------------------------------------------------
+# Sync/save with the server down: safe no-ops, state untouched
+# ---------------------------------------------------------------------------
+reset_all
+add_project p_alpha "$ALPHA" alpha
+tmux_ensure_session
+down_tab=$(tsess list-windows -t balamba -F '#{@balamba_tab}' | head -n1)
+down_win=$(window_id_for_tab "$down_tab")
+down_c0=$(content_ids "$down_win" | head -n1)
+tsess split-window -h -t "$down_c0" -c "$OTHER_CWD" 'sleep 900' >/dev/null 2>&1
+tmux_sync_panes
+down_state=$(jq -S . "$BALAMBA_STATE")
+tsess kill-server >/dev/null 2>&1 || true
+for _i in $(seq 1 100); do
+  tsess has-session -t balamba >/dev/null 2>&1 || break
+  sleep 0.02
+done
+assert_status 0 "down: sync is a safe no-op" tmux_sync_panes
+assert_eq "$down_state" "$(jq -S . "$BALAMBA_STATE")" "down: sync leaves state untouched"
+assert_status 0 "down: save is a safe no-op" tmux_save_runtime
+assert_eq "$down_state" "$(jq -S . "$BALAMBA_STATE")" "down: save leaves state untouched"
 
 finish_tests

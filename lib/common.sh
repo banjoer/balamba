@@ -214,7 +214,10 @@ def tab:
   and all(.panes[];
         type == "object"
         and (.index | num) and (.cwd | str)
-        and (.launched == "shell" or .launched == "agent"));
+        and (.launched == "shell" or .launched == "agent")
+        and ((.name == null) or (.name | str))
+        and ((.live_command == null) or (.live_command | str))
+        and ((.active == null) or (.active | bool)));
 def tabs: type == "array" and ids_unique and all(.[]; tab);
 def task:
   type == "object"

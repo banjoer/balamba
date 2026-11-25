@@ -196,7 +196,9 @@ are tmp-file + validate + atomic rename under `flock`). Version is `1`.
           "pane_count": 1,
           "layout": "",
           "active_pane": 0,
-          "panes": [{"index": 0, "cwd": "/home/me/src/balamba", "launched": "shell"}]
+          "panes": [{"index": 0, "cwd": "/home/me/src/balamba",
+                     "launched": "shell", "name": "zsh",
+                     "live_command": "zsh", "active": true}]
         }
       ],
       "tasks": [
@@ -266,8 +268,16 @@ Tab (window):
 - `layout`: raw tmux `#{window_layout}` for the whole window (chrome included);
   may be `""` before the first save/restore.
 - `active_pane`: 0-based **content** pane index (not the live tmux index).
-- `panes`: content panes only, in order. `index` is 0-based content-relative,
-  `cwd` is absolute, `launched` is `"shell"` or `"agent"`.
+- `panes`: content panes only, in live pane order. Each entry has:
+  - `index`: 0-based content-relative (`live pane index - 1`);
+  - `cwd`: absolute `#{pane_current_path}`;
+  - `launched`: `"shell"` or `"agent"` (creation/adoption history, not a live fact);
+  - `name`: short human label; tracked agent panes are never renamed, adopted panes
+    derive it from the live command with numeric disambiguation (`zsh`, `zsh 2`);
+  - `live_command`: last observed `#{pane_current_command}` (empty is allowed);
+  - `active`: whether this was the active content pane at the last sync.
+  `name`, `live_command` and `active` may be absent on documents written by older
+  builds; the schema accepts that and the next sync adds them.
 
 ### 5.2 Invariants
 
@@ -276,13 +286,17 @@ Tab (window):
 - All paths (`project.path`, `task.path`, pane `cwd`) are absolute.
 - `active.context` is `proj` or `task:<id>` and belongs to `active.project`
   whenever `active.project` is non-null.
-- Every `tab.panes` index is contiguous `0..pane_count-1`.
-- `active_pane < pane_count`.
+- Every `tab.panes` index is contiguous `0..pane_count-1`; `pane_count` equals
+  `panes | length`.
+- `active_pane < pane_count`; at most one pane has `active: true` after a sync.
 - State never contains tree/git chrome panes.
 - State never contains untracked directories: reconcile at startup removes tasks
   whose worktree is gone (warn on stderr), and never adopts unknown dirs.
+- Live tmux is the source of truth for panes: `tmux_sync_panes` drops panes that
+  vanished and adopts new splits; tabs of a context that has no live window are
+  kept (that context simply has not been built in this session).
 - `window` values are a snapshot; they can drift if a human moves windows. The
-  next `tmux_save_runtime` rewrites them.
+  next `tmux_save_runtime` (which syncs) rewrites them.
 
 Validation is structural (types, required fields, id uniqueness, context
 grammar, one JSON document). It deliberately does not enforce `p_`/`t_` id
@@ -392,6 +406,8 @@ the UI.
 | `new-terminal` | `[project-id] [context]` | `terminal_new_flow <project-id> <context>` | omitted = active project/context |
 | `close-task` | `<project-id> <task-id>` | `task_close_flow` | requires `lib/task.sh` |
 | `activate` | `<project-id> <context> [window]` | `tmux_activate` | requires `lib/tmux.sh` |
+| `focus-pane` | `<project-id> <context> <tab-id> <pane-index>` | `tmux_activate_pane` | content-relative index; missing pane re-syncs and exits 2 |
+| `sync` | `[context]` | `tmux_sync_panes` | prints nothing; adopted native splits land in state |
 | `expand` | `<project-id> [task-id]` | state update | implemented here; no lib needed |
 | `collapse` | `<project-id> [task-id]` | state update | implemented here; no lib needed |
 
@@ -561,7 +577,9 @@ empty, diagnostics go to stderr, success is `0`, failure is `2`.
 | `tmux_restore` | — | 0 / 2 |
 | `tmux_assert_widths` | — | 0 (no-op when no chrome) |
 | `tmux_save_runtime` | — | 0 / 2 |
+| `tmux_sync_panes [context]` | — | 0 (also when the server is down) |
 | `tmux_activate <pid> <context> [window]` | — | 0 / 2 |
+| `tmux_activate_pane <pid> <context> <tab-id> <index>` | — | 0 / 2 |
 
 ### 10.1 `tmux_server_up`
 
@@ -615,7 +633,8 @@ empty, diagnostics go to stderr, success is `0`, failure is `2`.
 - Shell tab: launch `$SHELL` in the cwd.
 - Append a tab object to the correct `tabs` array (project or task), record the
   live `window`, `pane_count` (content panes), empty layout or the current layout,
-  `active_pane=0`, and one pane entry per content pane.
+  `active_pane=0`, and one pane entry per content pane with `index`, `cwd`,
+  `launched`, `name`, `live_command` and `active` (pane 0 active).
 - Activate the new window (or leave it to the caller? **Contract: activate it**)
   and reassert widths.
 - stdout: the new tab id + newline.
@@ -643,7 +662,9 @@ Rebuild the whole UI from state (cold start). Condensed validated recipe:
    windows, so reassert chrome widths after attach.
 5. Map `list-panes -F '#{pane_index} #{pane_id}'` sorted by index: new index k =
    saved index k in slot order. `respawn-pane -k -t <pane-id> -c <cwd> <command>`
-   for each content pane; chrome panes run `python3 pane/ui.py tree|git`.
+   for **every** saved content pane (`panes[]`, at least `pane_count` of them);
+   agent panes resume their session, adopted/shell panes run `$SHELL`. Chrome
+   panes run `python3 pane/ui.py tree|git`.
 6. Restore each window's saved active content pane with `select-pane`
    (`window_layout` carries neither active pane nor active window).
 7. Move windows **descending** to their exact saved indices if there are gaps
@@ -664,13 +685,14 @@ Rebuild the whole UI from state (cold start). Condensed validated recipe:
 
 ### 10.8 `tmux_save_runtime`
 
-- Snapshot live state into `state.json`:
-  - per window/tab: live index, name, content pane count, `#{window_layout}`,
-    active content pane, per-content-pane `cwd` (`pane_current_path`).
-  - active project/context/window.
-- Content panes are saved in index order; chrome is skipped. A window with no
-  known tab is ignored; a tab with no live window keeps its last saved values.
-- Must be safe to call from a pane poll and on detach.
+- Call `tmux_sync_panes` first, then snapshot the active project/context/window
+  from the current client window (or the session's current window while
+  detached).
+- The sync is the single writer of pane fields, so detach captures manual
+  splits and dropped panes exactly like `internal sync`.
+- A window with no known tab is ignored; a tab whose context has no live window
+  keeps its last saved values (it is simply not built in this session).
+- Must be safe to call from a pane poll, on detach, and when the server is down.
 - No stdout. Exit `0`; `2` state/tmux failure.
 
 ### 10.9 `tmux_activate <project-id> <context> [window]`
@@ -682,14 +704,66 @@ Rebuild the whole UI from state (cold start). Condensed validated recipe:
   active content pane; focus the content pane (not chrome).
 - Set `@balamba_context` to `proj`/`task:<id>` and `@balamba_git_branch` to the
   context's branch (read-only display value; empty if unknown).
-- Reassert widths when the window becomes visible. No stdout.
+- Reassert widths when the window becomes visible. No stdout. Tab/context
+  activation is unchanged by pane focus.
 
-### 10.10 Optional functions
+### 10.10 `tmux_sync_panes [context]`
+
+Materialise the live content panes of every balamba window (a window with a
+non-empty `@balamba_tab`) into `state.json`. With `context`, only windows of
+that `proj`/`task:<id>` are considered; without it, all. Server down → return
+`0` without touching state.
+
+Algorithm, per live window, in this order:
+
+1. List panes in live `#{pane_index}` order and skip panes whose
+   `@balamba_chrome` is `tree` or `git`. Content index = live index - 1 (tree is
+   0, content is 1..n); this is also simply the surviving position after a kill.
+2. Read the tab's previous `panes[]`. For content index `i`, keep
+   `launched` (`agent`/`shell`) and `name` from `panes[i]` when it existed;
+   missing panes are adopted as `launched:"shell"`.
+3. For every pane update `cwd` (`pane_current_path`, falling back to the saved
+   cwd) and `live_command` (`pane_current_command`). Set `active` from
+   `pane_active`; the active content index becomes `active_pane` (clamped).
+4. Name an adopted pane from the basename of `live_command` with no arguments,
+   disambiguating (`zsh`, `zsh 2`, …). Never rename a tracked agent pane. A
+   known agent command (`opencode`/`claude`/`codex`) is recorded in
+   `live_command` only; adoption never creates a `session` or claims agent
+   tracking.
+5. Recompute `pane_count`, `layout` (`#{window_layout}`) and the tab's live
+   `window` index.
+6. A window with zero content panes is dead: kill it and remove its tab. A tab
+   whose window vanished is removed when its context still has a live window;
+   contexts with no live window are left alone (not built yet).
+
+Writes are debounced: a fingerprint (`cksum` of the canonical desired pane set:
+scope, per-tab window/layout/panes, removed ids) is stored in
+`$BALAMBA_RUNTIME/panes.fingerprint`; an unchanged fingerprint skips the state
+write. The update is one atomic state write and also keeps each context's tabs
+sorted by window. Idempotent, cheap enough for a poll, no stdout.
+
+`internal sync [context]` is the CLI surface for this function.
+
+### 10.11 `tmux_activate_pane <project-id> <context> <tab-id> <pane-index>`
+
+- Validate project/context/tab; `<pane-index>` is content-relative (0-based).
+- Ensure the tab's window exists (build the context if needed), select the
+  window, update `active.{project,context,window}`, set the global context and
+  reassert widths.
+- Select live content pane `pane_index` (`pane_index + 1` live index). Update the
+  tab's `active_pane` and `panes[].active` flags.
+- If the pane vanished between the click and the call, run `tmux_sync_panes` for
+  that context, print a clear warning naming the pane, and exit `2`; never
+  corrupt state and never fail with a raw tmux error.
+- `internal focus-pane <pid> <context> <tab-id> <index>` exposes it to the UI.
+
+### 10.12 Optional functions
 
 Part 4 may define `tmux_remove_project <project-id>` and
 `tmux_remove_context <project-id> <context>`; `bin/balamba` calls
 `tmux_remove_project` when present. They must be safe no-ops when the server is
-down.
+down. `tmux_remove_context` still only kills windows; state removal belongs to
+the git/task layer.
 
 Chrome pane convention: set `@balamba_chrome` to `tree` or `git` on the pane,
 `remain-on-exit on`, and detect respawns as described in §12.
@@ -783,6 +857,8 @@ origin/main / opencode). Never source the bash config from Python.
 
 ```
 $BALAMBA_ROOT/bin/balamba internal activate <project-id> <context> [window]
+$BALAMBA_ROOT/bin/balamba internal focus-pane <project-id> <context> <tab-id> <pane-index>
+$BALAMBA_ROOT/bin/balamba internal sync [context]
 $BALAMBA_ROOT/bin/balamba internal expand <project-id> [task-id]
 $BALAMBA_ROOT/bin/balamba internal collapse <project-id> [task-id]
 $BALAMBA_ROOT/bin/balamba internal new-task
@@ -790,6 +866,14 @@ $BALAMBA_ROOT/bin/balamba internal add-project
 $BALAMBA_ROOT/bin/balamba internal new-terminal
 $BALAMBA_ROOT/bin/balamba internal close-task <project-id> <task-id>
 ```
+
+- The tree renders tabs **and their `panes[]`**. Each pane row reads `name` as the
+  label and `live_command` as the detail, `active` for the cursor/highlight, and
+  calls `internal focus-pane` with the tab id and content-relative
+  `index` on click/Enter.
+- Run `internal sync` from the poll (for example when the active window changes
+  or every `active_refresh`) so a native split appears without waiting for a
+  detach/save. It prints nothing; ignore a non-zero exit and retry next poll.
 
 Use `subprocess.Popen`/`run` without a shell; inherit stdout/stderr only for
 error visibility. Do not block the render loop on an interactive flow; launch
@@ -836,7 +920,8 @@ and continue polling.
   git pane refreshes immediately instead of after `idle_refresh`.
 - Unread dots come from `window_activity_flag` (requires `monitor-activity on`,
   already in `tmux.conf`); do not invent custom unread state.
-- The tree renders projects → tasks → tabs. Active project expanded; manual
+- The tree renders projects → tasks → tabs → content panes (splits included),
+  using the live `panes[]` order from state. Active project expanded; manual
   expand/collapse lives in state and is changed through `internal expand` /
   `internal collapse`.
 - Keep the renderer small and dependency-free. If the pane is narrower than
@@ -870,9 +955,14 @@ avoids fork storms.
   Chrome panes never appear in state and are never counted in `pane_count`.
 - State pane indices are **content-relative** (`0..pane_count-1`); live tmux
   index = content index + 1. `active_pane` is content-relative too.
+- Native splits are adopted by `tmux_sync_panes`; the live pane set wins. Sync
+  is idempotent, debounced by a pane-set fingerprint, and never renames a
+  tracked agent pane or invents a session for an adopted command.
 - `layout` is the full window layout string (including chrome). On restore apply
   it only if the live pane count equals `pane_count + 2`; otherwise fall back to
-  equal content splits and reassert widths.
+  equal content splits and reassert widths. A single-content-pane window gets a
+  flat three-column layout (tmux 3.4 exits the server if a single-child
+  container's only leaf is killed).
 - `window` is the live window index snapshot. Windows can be moved by the user;
   the next save updates it. `renumber-windows off` + descending moves on restore
   reproduce gaps exactly.
@@ -916,8 +1006,9 @@ The full validated procedure is §10.6. The essential ordering, from
 3. Create windows in ascending saved order (`new-window -d -t balamba:`).
 4. Add panes, then apply the saved layout **only if the pane counts match**
    (fewer panes silently truncates; more panes errors).
-5. Respawn panes by sorted `pane_index` mapping, in saved slot order; agents
-   with `opencode --session ses_…`, shells with `$SHELL`, both in the saved cwd.
+5. Respawn **every** saved content pane (`panes[]`, not just pane 0) by sorted
+   `pane_index` mapping, in saved slot order; agent panes use the agent resume
+   command, adopted/shell panes use `$SHELL`, both in the saved cwd.
 6. Set each window's active pane explicitly; layouts do not carry it.
 7. Move windows descending into exact saved indices; select the saved active
    window; attach.

@@ -450,6 +450,29 @@ unset BALAMBA_FLOW_KIND
 assert_eq "0" "$CAP_RC" "internal new-terminal: env hook succeeds headless"
 assert_match '^tty_[0-9a-f]{8}$' "$CAP_OUT" "internal new-terminal: prints a tab id"
 assert_eq "$((before_tabs + 1))" "$(project_tabs "$PID")" "internal new-terminal: tab recorded"
+NEW_TERM_TAB=$CAP_OUT
+
+# internal sync materialises native splits; internal focus-pane selects one.
+capture run_balamba internal sync
+assert_eq "0" "$CAP_RC" "internal sync: succeeds"
+assert_eq "" "$CAP_OUT" "internal sync: prints nothing"
+NT_WIN=$(window_id_for_tab "$NEW_TERM_TAB")
+NT_C0=$(content_ids "$NT_WIN" | head -n1)
+tsess split-window -h -t "$NT_C0" -c "$CASE_ROOT" 'sleep 900' >/dev/null 2>&1
+capture run_balamba internal sync
+assert_eq "0" "$CAP_RC" "internal sync: reconciles a manual split"
+assert_eq "2" "$(balamba_state_get '
+  .projects[] | select(.id == $p) | .tabs[] | select(.id == $t) | .pane_count
+' --arg p "$PID" --arg t "$NEW_TERM_TAB")" "internal sync: split pane is in state"
+capture run_balamba internal focus-pane "$PID" proj "$NEW_TERM_TAB" 1
+assert_eq "0" "$CAP_RC" "internal focus-pane: succeeds"
+assert_eq "1" "$(tsess list-panes -t "$NT_WIN" \
+  -F $'#{pane_index}\t#{pane_active}\t#{@balamba_chrome}' 2>/dev/null |
+  awk -F '\t' '$3 == "" && $2 == 1 { n++ } END { print n + 0 }')" \
+  "internal focus-pane: selects the requested live pane"
+assert_eq "1" "$(balamba_state_get '
+  .projects[] | select(.id == $p) | .tabs[] | select(.id == $t) | .active_pane
+' --arg p "$PID" --arg t "$NEW_TERM_TAB")" "internal focus-pane: updates active_pane"
 
 # internal close-task via the documented confirmation hook
 export BALAMBA_FLOW_CLOSE_CONFIRM=1

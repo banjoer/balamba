@@ -54,6 +54,8 @@ Internal (tmux bindings and the UI panes)
   internal new-terminal [project-id] [context]
   internal close-task <project-id> <task-id>
   internal activate <project-id> <context> [window]
+  internal focus-pane <project-id> <context> <tab-id> <pane-index>
+  internal sync [context]
   internal expand <project-id> [task-id]
   internal collapse <project-id> [task-id]
   internal status <path>
@@ -209,6 +211,8 @@ cmd_internal() {
     new-terminal) internal_new_terminal "$@" ;;
     close-task)   internal_close_task "$@" ;;
     activate)     internal_activate "$@" ;;
+    focus-pane)   internal_focus_pane "$@" ;;
+    sync)         internal_sync "$@" ;;
     expand)       internal_expand "$@" ;;
     collapse)     internal_collapse "$@" ;;
     status)       internal_status "$@" ;;
@@ -276,6 +280,25 @@ internal_activate() {
   local -a args=("$pid" "$context")
   (($# == 3)) && args+=("$3")
   tmux_activate "${args[@]}" || exit $?
+}
+
+internal_focus_pane() {
+  (($# == 4)) || \
+    usage_error "usage: balamba internal focus-pane <project-id> <context> <tab-id> <pane-index>"
+  balamba_require_func tmux_activate_pane lib/tmux.sh "focus pane"
+  _balamba_require_project "$1"
+  tmux_activate_pane "$1" "$2" "$3" "$4" || exit $?
+}
+
+internal_sync() {
+  (($# <= 1)) || usage_error "usage: balamba internal sync [context]"
+  balamba_require_func tmux_sync_panes lib/tmux.sh "sync"
+  balamba_state_init
+  if (($# == 1)); then
+    tmux_sync_panes "$1" || exit $?
+  else
+    tmux_sync_panes || exit $?
+  fi
 }
 
 internal_expand() {

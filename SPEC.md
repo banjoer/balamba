@@ -24,6 +24,7 @@ projects → tasks (git worktrees) → terminals, with resume across restarts.
 ## Layout
 
 One tmux session `balamba`; each terminal tab is a tmux window; splits are tmux panes.
+Every content pane is a session: a tab's panes are listed in the tree, not just the tab.
 
 ```
 ┌──────────────┬────────────────────────────┬─────────────────┐
@@ -45,7 +46,9 @@ One tmux session `balamba`; each terminal tab is a tmux window; splits are tmux 
 
 ## Tree
 
-- Hierarchy: project (main checkout) → tasks (worktrees) → terminals (tabs).
+- Hierarchy: project (main checkout) → tasks (worktrees) → terminals (tabs) → panes.
+- A tab's content panes are rows (splits included), in live tmux order. Pane identity is
+  the tab plus its content index; state stores `name`, `live_command` and `active`.
 - Projects can also host scratch terminals in the main checkout, alongside tasks.
 - Active project expanded, others collapsed to one line; manual expand/collapse is remembered.
 - Keyboard: `j/k`/arrows move, `h/l` collapse/expand, `Enter` activate, `n` new task,
@@ -89,6 +92,13 @@ point (e.g. `origin/main`), which makes a stray `git push` target main.
 ## Terminals
 
 - Each terminal is a tab: `kind` (`agent`|`shell`), agent name, session uuid (agents), cwd.
+- A tab holds one or more **content panes**. Panes created by native tmux splits are
+  adopted on the next sync/save: they appear in the tree with the live cwd and command.
+  State is materialised from live tmux; chrome panes are never stored.
+- Adopted panes are `launched: "shell"` with a synthetic name from their live command
+  (`zsh`, `zsh 2`, …). Running `opencode`/`claude`/`codex` is recorded in `live_command`
+  only; adoption never invents a session. A tracked agent pane keeps its `launched: "agent"`,
+  name and tab `session` while its content index still matches.
 - Agent launch: `opencode --session ses_<32 hex>` in the tab's cwd. opencode rejects ids that do
   not start with `ses_`, so generate `ses_` + uuid4 hex at creation. The session materialises on
   the first message; the same id resumes it after a restart.
@@ -106,15 +116,19 @@ Trigger: `balamba` attaches to a running server (nothing to restore), or rebuild
 - Recreate windows/panes in saved order; restore split geometry from `window_layout` only when
   the live pane count equals the saved leaf count (a lower count is silently truncated otherwise),
   else fall back to equal splits.
+- Every saved content pane is respawned, not only the pane that existed at tab creation:
+  agent panes use the agent resume command, adopted/shell panes get a fresh `$SHELL` in their
+  saved cwd. A tab with no content pane is dead and is removed.
 - `window_layout` carries no active pane or active window: store and restore both separately.
 - Reassert sidebar widths after attach; tmux rescales each window's layout to the client size.
 - Agents: relaunch `opencode --session ses_<32 hex>` in the saved cwd, staggered ~0.5–1s apart
   (each TUI costs 3–7s startup and ~160MB).
 - Shells: fresh `$SHELL` in the saved cwd (`pane_current_path` captured on detach + every poll).
 - Anything else (vim, dev server): a plain shell in the saved cwd.
-- Dying server-side cwd capture happens on detach and on the tree's periodic poll.
+- Dying server-side cwd capture happens on detach and on the tree's periodic poll (`internal sync`).
 - Startup reconciles: worktrees removed by hand disappear from the tree; unknown dirs are ignored,
-  never adopted silently.
+  never adopted silently. Live splits are reconciled into state; windows/tabs that disappeared are
+  dropped.
 
 ## Git side panel
 
